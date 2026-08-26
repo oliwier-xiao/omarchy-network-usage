@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# net-usage — which apps used the network, in bytes.
+#
+# Wraps nethogs, which is the only tool on a stock Arch box that attributes
+# wire bytes to a process without a kernel module. Everything messy about its
+# output — a name field that contains slashes and spaces, totals printed in
+# scientific notation, container traffic that has no host pid — is dealt with
+# here, so the QML side only ever sees a clean table.
+#
+#   net-usage top [n]        one snapshot, human-readable. Run it yourself.
+#   net-usage stream [secs]  long-lived TSV for the bar widget
+#   net-usage probe          interface, date and container counters, once
+#   net-usage doctor         is anything missing, and what to do about it
+#
+# No sudo or pkexec is required: the nethogs package grants its own binary the
+# capabilities it needs at install time.
+
+set -uo pipefail
+
+VERSION=1.0.0
+NETHOGS=/usr/bin/nethogs
+
+# Rows longer than this are refused unread. A process name is really the whole
+# command line, and an Electron app's runs to 700 characters; something far
+# past that is not a name we want to hold in memory, let alone draw.
+MAX_LINE=4096
+# And a snapshot with more rows than this is a runaway, not a busy machine.
+MAX_ROWS=2000
+
+die() { printf 'net-usage: %s\n' "$*" >&2; exit 1; }
+
+# The interface carrying the default route. Monitoring every interface instead
+# double-counts: traffic from a container is seen once on the bridge and again
+# on the uplink, which reported a measured 3 MB download as 6.24 MB.
+default_iface() {
+  # An explicitly named interface wins: with a tunnel up, the same payload is
+  # visible as plaintext inside it and as encrypted UDP outside it, and only
+  # the person running it knows which of the two they meant to count.
+  if [ -n "${NET_USAGE_IFACE:-}" ]; then
+    printf '%s\n' "$NET_USAGE_IFACE"; return 0
+  fi
+  ip route show default 2>/dev/null | awk '/^default/ {
+    for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }
+  }'
+}
+
+# Container traffic never carries a host pid — the socket lives in another
+# network namespace, so nethogs files it under "unknown TCP". But
+# /proc/<pid>/net/dev is namespace-aware and world-readable, so reading it
+# through any process inside the container gives that container's own byte
+# counters exactly, with no privileges and no docker stats rounding.
+containers() {
+  [ "${NET_USAGE_CONTAINERS:-1}" = "1" ] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+
+  local ids
+  ids=$(timeout 2 docker ps -q 2>/dev/null) || return 0
+  [ -n "$ids" ] || return 0
+
+  # One call for every container. A wedged daemon costs one lookup and a
+  # skipped refresh, never a hung widget.
+  timeout 2 docker inspect --format '{{.Name}}|{{.State.Pid}}' $ids 2>/dev/null |
+  while IFS='|' read -r name pid; do
+    name=${name#/}
+    [ -n "$name" ] && [ -n "$pid" ] && [ "$pid" != "0" ] || continue
+    [ -r "/proc/$pid/net/dev" ] || continue
+    awk -v n="$name" '
+      NR > 2 {
+        iface = $1; sub(/:$/, "", iface)
+        if (iface == "lo") next
+        rx += $2; tx += $10
+      }
+      END { printf "ctr\t%s\t%.0f\t%.0f\n", n, rx + 0, tx + 0 }
+    ' "/proc/$pid/net/dev" 2>/dev/null
+  done
+}
+
+probe() {
+  printf 'iface\t%s\n' "$(default_iface)"
+  printf 'day\t%s\n' "$(date +%F)"
+  containers
+}
+
+doctor() {
+  local ok=0
+  if [ -x "$NETHOGS" ]; then
+    printf 'nethogs\tfound\t%s\n' "$NETHOGS"
+  else
+    printf 'nethogs\tmissing\t%s\n' "$NETHOGS"; ok=1
+  fi
+
+  # The package sets these itself on install. Without them nethogs cannot open
+  # a capture socket and exits immediately, which reads to a user as "the
+  # plugin is broken" rather than "this one binary lost its capabilities".
+  if command -v getcap >/dev/null 2>&1 && [ -x "$NETHOGS" ]; then
+    local caps; caps=$(getcap "$NETHOGS" 2>/dev/null)
+    case "$caps" in
+      *cap_net_raw*) printf 'caps\tok\t%s\n' "${caps#* }" ;;
+      *) printf 'caps\tmissing\treinstall the nethogs package to restore them\n'; ok=1 ;;
+    esac
+  fi
+
+  local i; i=$(default_iface)
+  [ -n "$i" ] && printf 'iface\tok\t%s\n' "$i" || { printf 'iface\tnone\tno default route\n'; ok=1; }
+
+  if command -v docker >/dev/null 2>&1; then
+    if timeout 2 docker ps -q >/dev/null 2>&1; then
+      printf 'docker\tok\tcontainer traffic will be named\n'
+    else
+      printf 'docker\tunreachable\tcontainer traffic stays in the unattributed row\n'
+    fi
+  else
+    printf 'docker\tabsent\tnothing to name\n'
+  fi
+  return $ok
+}
+
+# The accumulator. nethogs reports a running total per pid; pids come and go,
+# and a pid that dies is dropped from later snapshots, so summing the visible
+# rows would make an app's total fall. We therefore add per-pid deltas into a
+# per-app running total that only ever grows, and hand that to the caller.
+read -r -d '' ACCUMULATE <<'AWK'
+function appname(nm,   parts, k, first) {
+  # Chromium and every Electron app report their whole command line as the
+  # name. The binary is the first token; the rest is argv and is noise here.
+  first = nm
+  k = index(first, " ")
+  if (k > 0) first = substr(first, 1, k - 1)
+  # nethogs prints "curl" or "/usr/bin/curl" for the same binary depending on
+  # whether it managed to read /proc in time. Both must land in one row.
+  k = split(first, parts, "/")
+  return (parts[k] != "" ? parts[k] : first)
+}
+
+function refresh(   line, f, n, seen) {
+  # One helper call answers three questions: has the default route moved, has
+  # the day rolled over, and what have the containers transferred.
+  delete ctrSeen
+  while ((HELPER " probe" | getline line) > 0) {
+    n = split(line, f, "\t")
+    if (n >= 2 && f[1] == "iface") { curIface = f[2]; continue }
+    if (n >= 2 && f[1] == "day")   { curDay = f[2];   continue }
+    if (n >= 4 && f[1] == "ctr") {
+      nm = f[2]
+      if (!(nm in ctrBaseRx)) { ctrBaseRx[nm] = f[3] + 0; ctrBaseTx[nm] = f[4] + 0 }
+      # A container that restarts resets its counters; rebase rather than
+      # subtract a larger number from a smaller one.
+      if (f[3] + 0 < ctrBaseRx[nm]) ctrBaseRx[nm] = f[3] + 0
+      if (f[4] + 0 < ctrBaseTx[nm]) ctrBaseTx[nm] = f[4] + 0
+      ctrRx[nm] = f[3] + 0 - ctrBaseRx[nm]
+      ctrTx[nm] = f[4] + 0 - ctrBaseTx[nm]
+      ctrSeen[nm] = 1
+    }
+  }
+  close(HELPER " probe")
+}
+
+function emit(   a, cUp, cDown, unUp, unDown) {
+  printf "snap\t%s\n", curDay
+
+  # Container bytes cross the uplink too, so nethogs has already counted them
+  # once inside its unattributed bucket. Naming them here and leaving the
+  # bucket untouched would report the same traffic twice.
+  cUp = 0; cDown = 0
+  for (a in ctrSeen) { cUp += ctrTx[a]; cDown += ctrRx[a] }
+
+  for (a in accUp) {
+    if (a == "(unattributed)") continue
+    printf "row\t%.0f\t%.0f\tproc\t%s\n", accUp[a], accDown[a], a
+  }
+  for (a in ctrSeen)
+    printf "row\t%.0f\t%.0f\tcontainer\t%s\n", ctrTx[a], ctrRx[a], a
+
+  unUp = accUp["(unattributed)"] - cUp;     if (unUp < 0)   unUp = 0
+  unDown = accDown["(unattributed)"] - cDown; if (unDown < 0) unDown = 0
+  if (unUp > 0 || unDown > 0)
+    printf "row\t%.0f\t%.0f\tunattributed\t%s\n", unUp, unDown, "(unattributed)"
+
+  print "end"
+  fflush()
+}
+
+BEGIN { rows = 0; sinceProbe = PROBE_EVERY; curDay = ""; curIface = IFACE }
+
+# A snapshot boundary. Everything gathered since the last one is now complete.
+/^Refreshing:/ {
+  if (++sinceProbe >= PROBE_EVERY) { refresh(); sinceProbe = 0 }
+  # The route moving or the day turning both invalidate this nethogs process:
+  # it enumerated its interfaces once at startup and its counters are bound to
+  # the old day. Exiting drops the pipe, and the caller starts a fresh one.
+  if (curIface != "" && curIface != IFACE) exit 0
+  if (startDay == "") startDay = curDay
+  if (curDay != "" && curDay != startDay) exit 0
+  if (started) emit()
+  started = 1
+  rows = 0
+  next
+}
+
+length($0) > MAX_LINE { next }
+
+{
+  if (++rows > MAX_ROWS) next
+  if (split($0, F, "\t") != 3) next          # every banner and notice fails here
+
+  m = split(F[1], S, "/")
+  if (m < 3) next
+  uid = S[m]; pid = S[m - 1]
+  if (pid !~ /^[0-9]+$/ || uid !~ /^[0-9]+$/) next
+  name = S[1]
+  for (i = 2; i <= m - 2; i++) name = name "/" S[i]
+
+  # Printed at six significant digits, so anything past a megabyte arrives as
+  # 5.12971e+06. awk widens it correctly; parseInt would read it as 5.
+  up = F[2] + 0; down = F[3] + 0
+  if (up < 0 || down < 0) next
+
+  key = F[1]
+  du = up - lastUp[key];   if (du < 0) du = up
+  dd = down - lastDown[key]; if (dd < 0) dd = down
+  lastUp[key] = up; lastDown[key] = down
+
+  a = (pid + 0 == 0) ? "(unattributed)" : appname(name)
+  accUp[a] += du; accDown[a] += dd
+}
+
+END { if (started) emit() }
+AWK
+
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+
+run_accumulator() {
+  local iface=$1 interval=$2 probe_every=$3
+  "$NETHOGS" -t -C -v 2 -d "$interval" "$iface" 2>/dev/null |
+    awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
+        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE"
+}
+
+# Long-lived. Restarts nethogs when the accumulator stands down, which it does
+# when the default route moves or the day turns — nethogs enumerates its
+# interfaces exactly once at startup, so a Wi-Fi association or a tunnel coming
+# up after it started is invisible to it for the rest of its life.
+stream() {
+  local interval=${1:-2} iface
+  [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
+  while :; do
+    iface=$(default_iface)
+    if [ -z "$iface" ]; then
+      printf 'wait\tno default route\n'; sleep 5; continue
+    fi
+    printf 'ready\t%s\t%s\n' "$iface" "$interval"
+    run_accumulator "$iface" "$interval" 5
+    sleep 2
+  done
+}
+
+human() {
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i == 1 ? "%.0f %s" : "%.1f %s"), b, u[i]
+  }'
+}
+
+# The hand-runnable view. Watches for a few seconds and prints what moved.
+top() {
+  local n=${1:-10} secs=${2:-6} iface
+  [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
+  iface=$(default_iface) || true
+  [ -n "$iface" ] || die "no default route: nothing to watch"
+
+  printf 'Watching %s for %ss...\n\n' "$iface" "$secs"
+  local rows
+  rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "$iface" 2>/dev/null |
+    awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY=3 \
+        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE" |
+    awk '/^snap/ { buf = "" } /^row/ { buf = buf $0 "\n" } END { printf "%s", buf }')
+
+  [ -n "$rows" ] || { printf 'Nothing moved.\n'; return 0; }
+
+  printf '%-24s %12s %12s  %s\n' "APP" "DOWN" "UP" "SOURCE"
+  printf '%s\n' "$rows" |
+    sort -t"$(printf '\t')" -k3,3nr |
+    head -n "$n" |
+    while IFS="$(printf '\t')" read -r _ up down kind name; do
+      printf '%-24.24s %12s %12s  %s\n' \
+        "$name" "$(human "$down")" "$(human "$up")" "$kind"
+    done
+}
+
+case "${1:-top}" in
+  stream)  shift; stream "$@" ;;
+  top)     shift; top "$@" ;;
+  probe)   probe ;;
+  doctor)  doctor ;;
+  -V|--version) printf 'net-usage %s\n' "$VERSION" ;;
+  -h|--help)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command '${1}' — try: top, stream, probe, doctor" ;;
+esac
