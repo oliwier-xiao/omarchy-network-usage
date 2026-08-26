@@ -120,7 +120,7 @@ doctor() {
 # rows would make an app's total fall. We therefore add per-pid deltas into a
 # per-app running total that only ever grows, and hand that to the caller.
 read -r -d '' ACCUMULATE <<'AWK'
-function appname(nm,   parts, k, first) {
+function appname(nm, pid,   parts, k, first, path, line) {
   # Chromium and every Electron app report their whole command line as the
   # name. The binary is the first token; the rest is argv and is noise here.
   first = nm
@@ -129,7 +129,18 @@ function appname(nm,   parts, k, first) {
   # nethogs prints "curl" or "/usr/bin/curl" for the same binary depending on
   # whether it managed to read /proc in time. Both must land in one row.
   k = split(first, parts, "/")
-  return (parts[k] != "" ? parts[k] : first)
+  first = (parts[k] != "" ? parts[k] : first)
+
+  # And sometimes it hands back the /proc/<pid>/exe path itself rather than
+  # what the link points at, which reduces to a meaningless "exe". comm is
+  # world-readable even for another user's process, so ask it directly.
+  if (first == "exe" || first == "" || first ~ /^[0-9]+$/) {
+    path = "/proc/" pid "/comm"
+    line = ""
+    if ((getline line < path) > 0 && line != "") first = line
+    close(path)
+  }
+  return first
 }
 
 function refresh(   line, f, n, seen) {
@@ -220,7 +231,7 @@ length($0) > MAX_LINE { next }
   dd = down - lastDown[key]; if (dd < 0) dd = down
   lastUp[key] = up; lastDown[key] = down
 
-  a = (pid + 0 == 0) ? "(unattributed)" : appname(name)
+  a = (pid + 0 == 0) ? "(unattributed)" : appname(name, pid)
   accUp[a] += du; accDown[a] += dd
 }
 
