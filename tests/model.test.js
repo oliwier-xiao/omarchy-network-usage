@@ -1,0 +1,143 @@
+"use strict"
+
+const { test } = require("node:test")
+const assert = require("node:assert/strict")
+const Model = require("../lib/Model.js")
+
+// The single most dangerous line in the plugin. nethogs prints totals at six
+// significant digits, so anything past a megabyte arrives in scientific
+// notation; parseInt reads "3.09517e+06" as 3 and reports a 3 MB download as
+// three bytes, with nothing anywhere to suggest something went wrong.
+test("parseRow widens scientific notation instead of truncating it", () => {
+  const row = Model.parseRow("row\t82734\t3.09517e+06\tproc\tcurl")
+  assert.equal(row.up, 82734)
+  assert.equal(row.down, 3095170)
+  assert.notEqual(row.down, 3)
+})
+
+test("parseRow keeps a name that contains tabs-free spaces and slashes", () => {
+  const row = Model.parseRow("row\t10\t20\tproc\t/usr/lib/chromium/chromium")
+  assert.equal(row.name, "/usr/lib/chromium/chromium")
+  assert.equal(row.kind, "proc")
+})
+
+test("parseRow refuses every shape that is not a row", () => {
+  assert.equal(Model.parseRow("Refreshing:"), null)
+  assert.equal(Model.parseRow("Adding local address: 10.48.23.73"), null)
+  assert.equal(Model.parseRow("Unknown connection: 172.19.0.2:53736-172.66.0.218:80"), null)
+  assert.equal(Model.parseRow("snap\t2026-08-26"), null)
+  assert.equal(Model.parseRow("end"), null)
+  assert.equal(Model.parseRow(""), null)
+  assert.equal(Model.parseRow(null), null)
+  assert.equal(Model.parseRow("row\tnope\t20\tproc\tx"), null)
+  assert.equal(Model.parseRow("row\t-5\t20\tproc\tx"), null)
+  assert.equal(Model.parseRow("row\t10\t20\tproc\t"), null)
+})
+
+// A max of zero would make every width NaN and blank the chart, which reads as
+// a broken plugin rather than an empty one.
+test("barFraction floors the divisor so an empty chart still draws", () => {
+  assert.equal(Model.barFraction(0, 0), 0)
+  assert.equal(Model.barFraction(5, 0), 1)
+  assert.equal(Model.barFraction(50, 100), 0.5)
+  assert.equal(Model.barFraction(500, 100), 1, "never overflows the track")
+  assert.equal(Model.barFraction(-5, 100), 0)
+  assert.equal(Model.barFraction("x", 100), 0)
+})
+
+test("formatBytes uses 1024 and drops the decimal where it is noise", () => {
+  assert.equal(Model.formatBytes(0), "0 B")
+  assert.equal(Model.formatBytes(-1), "0 B")
+  assert.equal(Model.formatBytes(512), "512 B")
+  assert.equal(Model.formatBytes(1024), "1 KB")
+  assert.equal(Model.formatBytes(1536), "1.5 KB")
+  assert.equal(Model.formatBytes(1024 * 1024), "1 MB")
+  assert.equal(Model.formatBytes(3095170), "3 MB")
+  assert.equal(Model.formatBytes(1024 * 1024 * 150), "150 MB")
+})
+
+test("splitBytes separates the number from its unit", () => {
+  assert.deepEqual(Model.splitBytes(1536), { value: "1.5", unit: "KB" })
+  assert.deepEqual(Model.splitBytes(0), { value: "0", unit: "B" })
+})
+
+// Names are written by other people's programs and end up inside a shell
+// component that renders AutoText.
+test("plain strips anything a name could use as markup", () => {
+  assert.equal(Model.plain('<img src="http://x/">'), ' img src="http://x/" ')
+  assert.equal(Model.plain("a &amp; b"), "a  amp; b")
+  assert.equal(Model.plain("curl"), "curl")
+  assert.equal(Model.plain(null), "")
+})
+
+test("shiftKey crosses month and year boundaries", () => {
+  assert.equal(Model.shiftKey("2026-08-26", -1), "2026-08-25")
+  assert.equal(Model.shiftKey("2026-03-01", -1), "2026-02-28")
+  assert.equal(Model.shiftKey("2026-01-01", -1), "2025-12-31")
+  assert.equal(Model.shiftKey("nonsense", -1), "")
+})
+
+test("dayKey pads month and day", () => {
+  assert.equal(Model.dayKey(new Date(2026, 7, 26)), "2026-08-26")
+  assert.equal(Model.dayKey(new Date(2026, 0, 3)), "2026-01-03")
+})
+
+const DAY = {
+  up: 300, down: 3000,
+  apps: {
+    curl: { up: 100, down: 2000, kind: "proc" },
+    "webae-postgres": { up: 50, down: 900, kind: "container" },
+    "(unattributed)": { up: 0, down: 60, kind: "unattributed" },
+    chatty: { up: 150, down: 40, kind: "proc" },
+    silent: { up: 0, down: 0, kind: "proc" }
+  }
+}
+
+test("appList ranks by the direction asked for and drops empty rows", () => {
+  const down = Model.appList(DAY, "down")
+  assert.deepEqual(down.map(r => r.name), ["curl", "webae-postgres", "(unattributed)", "chatty"])
+  const up = Model.appList(DAY, "up")
+  assert.equal(up[0].name, "chatty", "upload ranks differently from download")
+})
+
+test("topRows rolls the tail into one row rather than dropping it", () => {
+  const rows = Model.topRows(Model.appList(DAY, "down"), 2, "down", true)
+  assert.equal(rows.length, 3)
+  assert.equal(rows[2].name, "2 more")
+  assert.equal(rows[2].down, 100, "the tail keeps its bytes")
+  assert.equal(rows[2].kind, "other")
+})
+
+test("topRows can hide the unattributed row without losing the others", () => {
+  const rows = Model.topRows(Model.appList(DAY, "down"), 10, "down", false)
+  assert.equal(rows.some(r => r.kind === "unattributed"), false)
+  assert.equal(rows.length, 3)
+})
+
+test("recentDays always returns the full strip, gaps included", () => {
+  const cells = Model.recentDays({ "2026-08-26": DAY }, "2026-08-26", 7)
+  assert.equal(cells.length, 7)
+  assert.equal(cells[6].key, "2026-08-26")
+  assert.equal(cells[6].isToday, true)
+  assert.equal(cells[0].down, 0, "a day with no record reads as zero, not as missing")
+  assert.equal(cells[6].down, 3000)
+})
+
+test("formatDate names the recent days and dates the rest", () => {
+  assert.equal(Model.formatDate("2026-08-26", "2026-08-26"), "Today")
+  assert.equal(Model.formatDate("2026-08-25", "2026-08-26"), "Yesterday")
+  assert.equal(Model.formatDate("2026-08-20", "2026-08-26"), "Thu 20 Aug")
+  assert.equal(Model.formatDate("", "2026-08-26"), "")
+})
+
+test("attributionNote stays quiet below one percent", () => {
+  assert.equal(Model.attributionNote(Model.appList(DAY, "down"), 3000), "2% could not be traced to an app")
+  const tiny = { up: 0, down: 10000, apps: { "(unattributed)": { up: 0, down: 1, kind: "unattributed" } } }
+  assert.equal(Model.attributionNote(Model.appList(tiny, "down"), 10000), "")
+})
+
+test("dayFor falls back to an empty day rather than undefined", () => {
+  const empty = Model.dayFor({}, null, "2026-01-01", "2026-08-26")
+  assert.equal(empty.down, 0)
+  assert.deepEqual(empty.apps, {})
+})

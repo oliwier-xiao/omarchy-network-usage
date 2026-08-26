@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  js:
+    name: lib checks + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check
+        run: node --check lib/Model.js && node --check lib/Palette.js
+      - name: Unit tests
+        run: node --test tests/
+
+  shell:
+    name: collector checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n bin/net-usage
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning bin/net-usage || true
+
+  manifest:
+    name: manifest shape
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Valid JSON
+        run: jq -e . manifest.json > /dev/null
+      - name: schemaVersion is the number 1
+        run: jq -e '.schemaVersion == 1' manifest.json > /dev/null
+      - name: Declared entry points exist
+        run: |
+          for ep in $(jq -r '.entryPoints[]' manifest.json); do
+            test -f "$ep" || { echo "missing entry point: $ep"; exit 1; }
+          done
+      - name: Every kind has its entry point
+        run: |
+          jq -e '(.kinds | index("service") | not) or (.entryPoints | has("service"))' manifest.json > /dev/null
+          jq -e '(.kinds | index("bar-widget") | not) or (.entryPoints | has("barWidget"))' manifest.json > /dev/null
+      - name: No symlinks anywhere
+        run: |
+          found=$(find . -path ./.git -prune -o -type l -print)
+          test -z "$found" || { echo "symlinks are not allowed: $found"; exit 1; }
