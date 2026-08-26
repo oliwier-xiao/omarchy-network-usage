@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "id": "oliwier.network-usage",
+  "name": "Network Usage",
+  "version": "1.0.0",
+  "author": "oliwier-xiao",
+  "license": "MIT",
+  "description": "Which apps used your bandwidth, in bytes, with a day of history behind it. Two ranked bar charts — one for what came down, one for what went up — measured at packet level, so QUIC and UDP count too, and traffic from a container arrives under the container's name instead of a hole in the numbers.",
+  "homepage": "https://github.com/oliwier-xiao/omarchy-network-usage",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Network Usage",
+    "description": "Today's download and upload, ranked by the app that spent it.",
+    "category": "Network",
+    "aliases": [
+      "network",
+      "bandwidth",
+      "traffic",
+      "data",
+      "usage"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barLabel": "Download",
+      "sampleSeconds": 2,
+      "topApps": 8,
+      "nameContainers": true,
+      "showUnattributed": true,
+      "keepDays": 90,
+      "interface": ""
+    },
+    "schema": [
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Next to the bar icon",
+        "options": [
+          "Download",
+          "Both directions",
+          "Nothing"
+        ],
+        "defaultValue": "Download",
+        "description": "Download is the number you came here for and the narrow one, so it is the default. Both directions answers the upload question without opening anything, and costs roughly double the width on a bar where width is contested. Nothing leaves the icon, and the panel does the talking."
+      },
+      {
+        "key": "topApps",
+        "type": "integer",
+        "label": "Apps per chart",
+        "min": 3,
+        "max": 15,
+        "step": 1,
+        "defaultValue": 8,
+        "description": "How many bars each chart draws before the rest are summed into a final row. Eight fits the panel without scrolling and is usually past the point where the bars are too short to compare."
+      },
+      {
+        "key": "nameContainers",
+        "type": "boolean",
+        "label": "Name container traffic",
+        "defaultValue": true,
+        "description": "Traffic from a container has no process on this side of the namespace, so on its own it arrives as an unnamed lump. Reading each container's own byte counters puts a name on it — which matters most on the day a build pulled a few gigabytes and nothing on the machine will say what did. Needs access to the container daemon; without it the traffic simply stays unattributed."
+      },
+      {
+        "key": "showUnattributed",
+        "type": "boolean",
+        "label": "Show what could not be attributed",
+        "defaultValue": true,
+        "description": "Some bytes genuinely cannot be traced to an app from user space. Showing that row keeps the chart honest about the size of the gap; hiding it makes the totals look tidier than they are."
+      },
+      {
+        "key": "sampleSeconds",
+        "type": "integer",
+        "label": "Sample every",
+        "min": 1,
+        "max": 10,
+        "step": 1,
+        "defaultValue": 2,
+        "description": "Seconds between readings. The cost is one short burst of parsing per reading, so this is a battery setting rather than an accuracy one — totals are counted at packet level between readings, not sampled from them, and nothing is lost by reading less often."
+      },
+      {
+        "key": "keepDays",
+        "type": "integer",
+        "label": "Keep history for",
+        "min": 7,
+        "max": 365,
+        "step": 1,
+        "defaultValue": 90,
+        "description": "Days. Older days are dropped when the file is next written, which keeps it small enough to load in one go. A quarter is enough to recognise the month a habit changed."
+      },
+      {
+        "key": "interface",
+        "type": "string",
+        "label": "Watch this interface",
+        "defaultValue": "",
+        "description": "Leave empty to follow the default route, which is the right answer almost always and re-checks itself when the route moves. Name one instead when a tunnel is up and you want to count the traffic inside it rather than the encrypted outside — counting both would count the same bytes twice."
+      }
+    ]
+  }
+}
