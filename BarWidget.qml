@@ -42,6 +42,7 @@ BarWidget {
     s.sampleSeconds = Number(setting("sampleSeconds", 2)) || 2
     s.keepDays = Number(setting("keepDays", 90)) || 90
     s.nameContainers = setting("nameContainers", true) === true
+    s.countLanNoise = setting("countLanNoise", false) === true
     s.interfaceName = String(setting("interface", ""))
   }
 

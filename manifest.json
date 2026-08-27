@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "oliwier.network-usage",
   "name": "Network Usage",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "oliwier-xiao",
   "license": "MIT",
   "description": "Which apps used your bandwidth, in bytes, with a day of history behind it. Two ranked bar charts — one for what came down, one for what went up — measured at packet level, so QUIC and UDP count too, and traffic from a container arrives under the container's name instead of a hole in the numbers.",
@@ -74,6 +74,13 @@
         "label": "Show what could not be attributed",
         "defaultValue": true,
         "description": "Some bytes genuinely cannot be traced to an app from user space. Showing that row keeps the chart honest about the size of the gap; hiding it makes the totals look tidier than they are."
+      },
+      {
+        "key": "countLanNoise",
+        "type": "boolean",
+        "label": "Count broadcast traffic nothing asked for",
+        "defaultValue": false,
+        "description": "A shared network carries every host's broadcast and multicast chatter — mDNS, NetBIOS, SSDP — to every card on it. This machine receives that traffic because it is addressed to everyone, no socket here owns a byte of it, and the kernel discards it. On a busy office network it can be most of the inbound total for the day, and because it belongs to no process it can only ever be drawn as one enormous unnamed bar. Left off, the charts show what this machine actually used. Turn it on to measure the wire instead, and run `net-usage explain` to see what it consists of."
       },
       {
         "key": "sampleSeconds",

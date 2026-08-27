@@ -30,6 +30,7 @@ Item {
   property int sampleSeconds: 2
   property int keepDays: 90
   property bool nameContainers: true
+  property bool countLanNoise: false
   property string interfaceName: ""
 
   readonly property string home: Quickshell.env("HOME")
@@ -159,6 +160,7 @@ Item {
   onSampleSecondsChanged: root.restartStream()
   onInterfaceNameChanged: root.restartStream()
   onNameContainersChanged: root.restartStream()
+  onCountLanNoiseChanged: root.restartStream()
 
   Timer {
     id: startTimer
@@ -176,7 +178,8 @@ Item {
     environment: ({
       "HOME": root.home,
       "NET_USAGE_IFACE": root.interfaceName,
-      "NET_USAGE_CONTAINERS": root.nameContainers ? "1" : "0"
+      "NET_USAGE_CONTAINERS": root.nameContainers ? "1" : "0",
+      "NET_USAGE_LAN_NOISE": root.countLanNoise ? "1" : "0"
     })
 
     stdout: SplitParser {
@@ -308,9 +311,40 @@ Item {
     startTimer.restart()
   }
 
+  // 1.0.0 counted the broadcast and multicast traffic that no socket on this
+  // machine owns, and filed all of it under one name. On a shared network that
+  // was routinely most of a day — one enormous bar standing for bytes nothing
+  // here asked for or read. The real bytes in that row cannot be separated
+  // from the noise after the fact, and keeping it would mean charts that
+  // promise to leave that traffic out while still drawing it. So it goes, once,
+  // on the upgrade, and the day totals come down with it.
+  // Rebuilt rather than edited in place: what the adapter hands back is its
+  // own nested value, and deleting a key inside it neither takes effect nor
+  // marks the adapter dirty, so the write would go out still carrying the row.
+  function dropLegacyBucket(store) {
+    var LEGACY = "(unattributed)"
+    var out = {}
+    var touched = false
+    for (var k in store) {
+      var day = store[k]
+      if (!day || !day.apps || !day.apps[LEGACY]) { out[k] = day; continue }
+      var row = day.apps[LEGACY]
+      var apps = {}
+      for (var n in day.apps) if (n !== LEGACY) apps[n] = day.apps[n]
+      out[k] = {
+        up: Math.max(0, (day.up || 0) - (row.up || 0)),
+        down: Math.max(0, (day.down || 0) - (row.down || 0)),
+        apps: apps
+      }
+      touched = true
+    }
+    if (touched) root.pendingWrite = true
+    return out
+  }
+
   function onHistoryLoaded() {
     var loaded = historyAdapter.days
-    root.days = (loaded && typeof loaded === "object") ? loaded : ({})
+    root.days = root.dropLegacyBucket((loaded && typeof loaded === "object") ? loaded : ({}))
     root.begin()
   }
 
