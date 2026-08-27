@@ -38,8 +38,8 @@ if [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ]; then NH_FILTER=(); fi
 # Quickshell's FileView will hand it whatever is at a path with no ceiling on
 # how much it reads. The history file sits at a predictable location in a
 # directory every process running as this user can write to, so it is read
-# here instead — in a child process, through a descriptor checked after it is
-# open, and never more than this many bytes. 90 days of a busy machine is
+# here instead — in a child process, through one descriptor that answers for
+# itself, and never more than this many bytes. 90 days of a busy machine is
 # well under a megabyte.
 MAX_HISTORY=$((8 * 1024 * 1024))
 
@@ -421,25 +421,65 @@ history_path() {
   printf '%s/.local/state/omarchy/network-usage/history.json' "${HOME:-}"
 }
 
-# Three guards, because each one alone is insufficient. The type test refuses a
-# FIFO before the open, which would otherwise block with no descriptor yet to
-# inspect. The descriptor test then re-checks what was actually opened, which a
-# path swapped in between cannot change. And head bounds the read regardless of
-# what either test concluded — that last one is the guard that holds even if
-# the other two are raced.
+# One open, and every question after it asked of the descriptor rather than of
+# the name. Testing the path first and opening it second cannot be made safe: a
+# FIFO put at the name in that window swallows the read inside open(2), where
+# there is no descriptor yet to inspect and no timeout around the reader can
+# help — five reads in two hundred hung that way under a swap storm here. So the
+# flags refuse at the open itself. O_NOFOLLOW declines a symlink at the last
+# component instead of resolving it, O_NONBLOCK hands back a descriptor for a
+# FIFO immediately instead of waiting on a writer, and fstat on that same
+# descriptor settles type, owner and size. Whatever is put at the path
+# afterwards is a different file, and this one is already open.
+#
+# An oversized file is refused whole rather than truncated to the ceiling: half
+# a JSON document is not a shorter history, it is a parse error that arrives
+# looking like no history at all. But refusing whole prints nothing, and nothing
+# is also what an ordinary first run prints, so the two are told apart by the
+# exit status instead: 3 means there is something at that path and it is not a
+# history we will read. The caller keeps it aside rather than writing over it.
+#
+# perl, because the shell has no way to pass open flags, and because omarchy
+# depends on it already.
 history_read() {
-  local f
-  f=$(history_path)
-  [ -n "$f" ] || return 0
-  [ -f "$f" ] || return 0
-  if [ -L "$f" ]; then return 0; fi
+  [ -n "${HOME:-}" ] || return 0
+  command -v perl >/dev/null 2>&1 || {
+    printf 'net-usage: perl is missing, so history cannot be read safely\n' >&2
+    return 0
+  }
 
-  exec 3< "$f" 2>/dev/null || return 0
-  if [ -f /dev/fd/3 ]; then
-    head -c "$MAX_HISTORY" <&3
-  fi
-  exec 3<&-
-  return 0
+  perl -- - "$(history_path)" "$MAX_HISTORY" <<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);
+use Errno qw(EINTR ENOENT);
+
+my ($path, $max) = @ARGV;
+
+# ELOOP here is a symlink at the last component, which is a refusal and not an
+# absence; only ENOENT means there is genuinely nothing to read.
+sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+  or exit($! == ENOENT ? 0 : 3);
+
+my @st = stat($fh) or exit 3;
+my ($mode, $uid, $size) = @st[2, 4, 7];
+
+exit 3 unless ($mode & 0170000) == 0100000;   # not a FIFO, device or directory
+exit 3 unless $uid == $<;                     # and written by this user
+exit 3 if $size > $max;                       # refused whole, never truncated
+
+binmode $fh;
+binmode STDOUT;
+my $left = $size;
+while ($left > 0) {
+  my $n = sysread($fh, my $buf, $left < 65536 ? $left : 65536);
+  if (!defined $n) { next if $! == EINTR; last }
+  last if $n == 0;
+  print STDOUT $buf;
+  $left -= $n;
+}
+exit 0;
+PERL
 }
 
 case "${1:-top}" in

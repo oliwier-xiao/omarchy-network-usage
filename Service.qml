@@ -318,9 +318,18 @@ Item {
     stdout: StdioCollector {
       onStreamFinished: root.onHistoryText(this.text)
     }
-    // If it never produced a stream at all — missing, killed, refused — the
-    // plugin still has to start, on an empty day rather than not at all.
-    onExited: if (!root.ready) root.onHistoryText("")
+    // 3 is the reader saying there is something at that path that it will not
+    // read: too large, not a regular file, not ours. It printed nothing — and so
+    // does an ordinary first run, so without this the next save would quietly
+    // write over whatever was there. Keep it aside instead, as with one that
+    // will not parse.
+    //
+    // And if it produced no stream at all — missing, killed — the plugin still
+    // has to start, on an empty day rather than not at all.
+    onExited: function (code) {
+      if (code === 3) keepBrokenProc.running = true
+      if (!root.ready) root.onHistoryText("")
+    }
   }
 
   function begin() {
@@ -377,8 +386,9 @@ Item {
       try {
         raw = JSON.parse(s)
       } catch (e) {
-        // Unparseable, which includes the file having been truncated at the
-        // read ceiling. Keep it aside once so it is not silently overwritten.
+        // Unparseable. Keep it aside once so it is not silently overwritten —
+        // the other way in here is the reader exiting 3, which means it refused
+        // to hand the file over at all.
         keepBrokenProc.running = true
         raw = null
       }
@@ -392,9 +402,10 @@ Item {
     root.begin()
   }
 
-  // A history file that will not parse is not worth losing the day over, but
-  // it is also not worth overwriting silently: keep it aside once, then start
-  // clean. A missing file is the ordinary first run and says nothing.
+  // A history file that will not parse, or that the reader refused to hand over,
+  // is not worth losing the day over — but it is also not worth overwriting
+  // silently: keep it aside once, then start clean. A missing file is the
+  // ordinary first run and says nothing.
 
 
   Process {
