@@ -59,16 +59,57 @@ counts.
 Totals are counted continuously between samples, not sampled from them, so a shorter sample
 interval does not make them more accurate. It only makes the panel newer.
 
-## The unattributed row
+## What nothing on this machine asked for
 
-Some bytes genuinely cannot be traced to an app from user space. A socket living in another
-network namespace has no process on this side of it, and some overhead belongs to no app at all.
-Rather than quietly dropping those bytes or spreading them over the apps that can be named, they
-get their own row.
+A shared network carries every host's broadcast and multicast chatter — mDNS, NetBIOS, SSDP — to
+every card attached to it. Your machine receives that traffic because it is addressed to everyone,
+no socket here owns a single byte of it, and the kernel discards it on arrival. It is not a
+download. Nothing requested it and nothing read it.
 
-With **Name container traffic** on, most of what would land there is pulled back out and named,
-so the row is usually small. If it is ever the largest bar, that is worth knowing rather than
-worth hiding.
+Packet-level accounting still counts it, and since it belongs to no process it can only ever be
+drawn as one enormous unnamed bar. On a busy office network it is routinely most of the inbound
+total for the day — a couple of kilobytes a second, every second, which is a few hundred megabytes
+by midnight. The charts leave it out, so what you see is what this machine actually used.
+
+To see what it consists of on your network:
+
+```
+~/.config/omarchy/plugins/oliwier.network-usage/bin/net-usage explain
+```
+
+Six pcap filters run over one shared window, so the shares are comparable:
+
+```
+ARRIVING ON THE WIRE                   DOWN  SHARE
+everything                          10.7 KB   100%
+not addressed to this host           9.2 KB    86%
+  mDNS / Bonjour (5353)              5.9 KB    54%
+  NetBIOS (137, 138)                 3.9 KB    36%
+  SSDP / UPnP (1900)                    0 B     0%
+QUIC (udp 443)                          0 B     0%
+```
+
+**Count broadcast traffic nothing asked for** puts it back in, for measuring the wire rather than
+the machine.
+
+Version 1.0.0 counted it. Upgrading drops the one row it was recorded under, once, and brings the
+affected day totals down with it — the real bytes in that row cannot be told apart from the noise
+after the fact, and leaving it in would mean charts that promise to exclude that traffic while
+still drawing it.
+
+## The two unknown rows
+
+What is left over after that genuinely cannot be traced from user space, and it gets its own row
+per protocol rather than one shared lump, because the two have different causes.
+
+**(unknown TCP)** is almost always a container. A socket living in another network namespace has
+no process on this side of it. With **Name container traffic** on, most of it is pulled back out
+and named, so this row is usually small.
+
+**(unknown UDP)** is a connectionless socket that closed before it could be matched to a process,
+or QUIC that arrived faster than the mapping could keep up.
+
+If either is ever the largest bar, that is worth knowing rather than worth hiding.
 
 ## Two charts, not one
 
@@ -90,6 +131,7 @@ is lost if the two hues read the same to you.
 | Apps per chart | 8 | Bars drawn before the rest are summed into one row. Click that row, or press `e`, to list them all. |
 | Name container traffic | on | Reads each container's own byte counters and puts a name on them. |
 | Show what could not be attributed | on | Keeps the chart honest about the size of the gap. |
+| Count broadcast traffic nothing asked for | off | Adds back the chatter no socket here owns. |
 | Sample every | 2s | A battery setting, not an accuracy one. |
 | Keep history for | 90 days | Older days are dropped when the file is next written. |
 | Watch this interface | empty | Empty follows the default route. Name one when a tunnel is up. |
@@ -131,13 +173,14 @@ using my connection right now":
 APP                              DOWN           UP  SOURCE
 curl                           3.9 MB      76.4 KB  proc
 webae-postgres                 2.9 MB      79.1 KB  container
-(unattributed)                45.8 KB          0 B  unattributed
 claude                         4.9 KB      65.9 KB  proc
+(unknown TCP)                  1.2 KB          0 B  unattributed
 ```
 
 `net-usage top [rows] [seconds]` watches for a few seconds and ranks what moved.
-`net-usage doctor` reports what is missing. `net-usage probe` prints the interface, the date and
-the container counters once.
+`net-usage explain [seconds]` breaks the inbound traffic down by pcap filter, which is how you
+find out what an unnamed bar was made of. `net-usage doctor` reports what is missing.
+`net-usage probe` prints the interface, the date and the container counters once.
 
 ## What it cannot tell you
 
