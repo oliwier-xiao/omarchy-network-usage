@@ -11,6 +11,7 @@
 #   net-usage stream [secs]  long-lived TSV for the bar widget
 #   net-usage explain [s]    what the untraceable bytes actually were
 #   net-usage history        the saved history file, bounded and type-checked
+#   net-usage save           replace that file with the store on stdin
 #   net-usage probe          interface, date and container counters, once
 #   net-usage doctor         is anything missing, and what to do about it
 #
@@ -482,11 +483,82 @@ exit 0;
 PERL
 }
 
+# The other half of the same problem. Quickshell's FileView calls its write
+# atomic, and it is — onto the path it resolved, which means a symlink parked at
+# history.json is followed and whatever it points at is overwritten instead. That
+# was measured on this version: the plugin's own store landed in an unrelated
+# file, every twenty seconds, with the symlink still standing.
+#
+# So the store is written here as well. The temporary file is created with
+# O_EXCL, which means this open makes the name or fails — there is nothing there
+# for a symlink to be — and O_NOFOLLOW is the brace to that belt. Then rename(2),
+# which replaces the *name*: a symlink sitting at history.json is what gets
+# replaced, and what it pointed at is never opened at all.
+history_write() {
+  [ -n "${HOME:-}" ] || return 1
+  command -v perl >/dev/null 2>&1 || {
+    printf 'net-usage: perl is missing, so history cannot be written safely\n' >&2
+    return 1
+  }
+
+  # The program arrives on fd 3, not on stdin: stdin is the store being written,
+  # and `perl -` would eat it as source text.
+  perl /dev/fd/3 "$(history_path)" "$MAX_HISTORY" 3<<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_NOFOLLOW);
+use Errno qw(EINTR);
+use IO::Handle;
+
+my ($path, $max) = @ARGV;
+my ($dir) = $path =~ m{^(.*)/[^/]+$};
+exit 1 unless defined $dir && length $dir;
+
+# Bounded here too. A store this side of the ceiling is one the reader will
+# still accept next time; anything past it would be written once and refused
+# forever after, which is a worse outcome than not writing it.
+binmode STDIN;
+my $doc = '';
+while (1) {
+  my $n = sysread(STDIN, my $buf, 65536);
+  if (!defined $n) { next if $! == EINTR; exit 1 }
+  last if $n == 0;
+  $doc .= $buf;
+  exit 1 if length($doc) > $max;
+}
+exit 1 unless length $doc;
+
+my ($fh, $tmp);
+for my $try (1 .. 16) {
+  $tmp = sprintf('%s/.history.%d.%d.tmp', $dir, $$, $try);
+  last if sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  undef $fh;
+}
+exit 1 unless $fh;
+
+binmode $fh;
+my $off = 0;
+while ($off < length $doc) {
+  my $n = syswrite($fh, $doc, length($doc) - $off, $off);
+  if (!defined $n) { next if $! == EINTR; close $fh; unlink $tmp; exit 1 }
+  $off += $n;
+}
+# On the disk before the name points at it, so a power cut leaves the old store
+# rather than a new one full of holes.
+$fh->sync;
+close($fh) or do { unlink $tmp; exit 1 };
+
+unless (rename($tmp, $path)) { unlink $tmp; exit 1 }
+exit 0;
+PERL
+}
+
 case "${1:-top}" in
   stream)  shift; stream "$@" ;;
   top)     shift; top "$@" ;;
   explain) shift; explain "$@" ;;
   history) history_read ;;
+  save)    history_write ;;
   probe)   probe ;;
   doctor)  doctor ;;
   -V|--version) printf 'net-usage %s\n' "$VERSION" ;;

@@ -273,6 +273,9 @@ Item {
 
   function save() {
     if (!root.ready) return
+    // One writer at a time. Skipping leaves pendingWrite standing, so the next
+    // tick of the timer picks it up rather than the sample being dropped.
+    if (historyWrite.running) return
     root.days = root.pruneOld(root.days)
     // Capped on the way out as well as on the way in. This is the only writer,
     // so it is the place a file that the next read would have to truncate gets
@@ -280,9 +283,10 @@ Item {
     var capped = {}
     for (var k in root.days) capped[k] = Model.capApps(root.days[k], Model.MAX_APPS_PER_DAY)
     root.days = capped
-    historyAdapter.days = root.days
-    historyFile.writeAdapter()
+    root.pendingDoc = JSON.stringify({ days: root.days })
     root.pendingWrite = false
+    historyWrite.stdinEnabled = true
+    historyWrite.running = true
   }
 
   Timer {
@@ -293,19 +297,30 @@ Item {
     onTriggered: if (root.pendingWrite) root.save()
   }
 
-  // Write-only, deliberately. FileView has no ceiling on what it will read and
-  // no way to add one, and the process it would read into is the shell the
-  // whole desktop runs in. Reading is bin/net-usage's job, where it is bounded.
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    printErrors: false
-    atomicWrites: true
-    blockAllReads: true
+  // FileView is gone from this side too, and for the same reason it went from the
+  // read side. Its write is atomic onto the path it *resolved*, so a symlink
+  // parked at history.json is followed and whatever it points at is overwritten
+  // instead — measured on this version, with the store landing in an unrelated
+  // file every twenty seconds and the symlink still standing afterwards. No
+  // property turns that off.
+  //
+  // bin/net-usage save creates its temporary file with O_EXCL and O_NOFOLLOW —
+  // that open makes the name or fails, so there is nothing there for a symlink to
+  // be — and then renames onto history.json. rename(2) replaces the name, so a
+  // symlink sitting there is what gets replaced, and its target is never opened.
+  property string pendingDoc: ""
 
-    JsonAdapter {
-      id: historyAdapter
-      property var days: ({})
+  Process {
+    id: historyWrite
+    running: false
+    stdinEnabled: true
+    command: [root.pluginDir + "/bin/net-usage", "save"]
+    environment: ({ "HOME": root.home })
+    onStarted: {
+      historyWrite.write(root.pendingDoc)
+      // Closing the pipe is what tells the child the store is complete; without
+      // it the child sits in read() until the timeout kills it.
+      historyWrite.stdinEnabled = false
     }
   }
 
@@ -446,5 +461,12 @@ Item {
     }
   }
 
+  // Best effort, and worth saying why. A write through a child process does not
+  // survive this: the bytes go into Qt's buffer and the event loop that would
+  // flush them is already stopping, so the last sample can be lost when the shell
+  // is restarted. FileView's write did survive it, which is the one thing giving
+  // it up costs — measured at both ends rather than assumed. What is lost is at
+  // most one save interval of byte counters on a clean shutdown, against a write
+  // path that used to follow a symlink out of the state directory entirely.
   Component.onDestruction: if (root.pendingWrite) root.save()
 }
