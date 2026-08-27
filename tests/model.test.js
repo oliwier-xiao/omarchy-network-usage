@@ -114,6 +114,20 @@ test("topRows can hide the unattributed row without losing the others", () => {
   assert.equal(rows.length, 3)
 })
 
+// A roll-up surviving beside the rows it stood for would count its bytes twice.
+test("an unlimited topRows lists every app and drops the roll-up", () => {
+  const all = Model.appList(DAY, "down")
+  const capped = Model.topRows(all, 2, "down", true)
+  const rows = Model.topRows(all, Infinity, "down", true)
+
+  assert.equal(rows.some(r => r.kind === "other"), false, "no roll-up row")
+  assert.equal(rows.length, all.length, "every app is listed")
+  assert.equal(
+    rows.reduce((t, r) => t + r.down, 0),
+    capped.reduce((t, r) => t + r.down, 0),
+    "expanding moves no bytes, it only stops summarising them")
+})
+
 test("recentDays always returns the full strip, gaps included", () => {
   const cells = Model.recentDays({ "2026-08-26": DAY }, "2026-08-26", 7)
   assert.equal(cells.length, 7)
