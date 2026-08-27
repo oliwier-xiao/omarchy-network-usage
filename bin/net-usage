@@ -9,6 +9,7 @@
 #
 #   net-usage top [n]        one snapshot, human-readable. Run it yourself.
 #   net-usage stream [secs]  long-lived TSV for the bar widget
+#   net-usage explain [s]    what the untraceable bytes actually were
 #   net-usage probe          interface, date and container counters, once
 #   net-usage doctor         is anything missing, and what to do about it
 #
@@ -17,8 +18,20 @@
 
 set -uo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 NETHOGS=/usr/bin/nethogs
+
+# The uplink also carries the whole subnet's broadcast and multicast chatter —
+# mDNS, NetBIOS, SSDP. The card receives it because it is addressed to
+# everyone, no socket on this machine owns a single byte of it, and the kernel
+# drops it on the floor. nethogs counts it anyway and, having no process to
+# charge it to, files all of it under "unknown". On a busy corporate LAN that
+# is routinely most of the day's inbound total, which turns the chart into one
+# enormous unnamed bar that answers nothing and alarms everyone who sees it.
+# Drop it at the capture, where it costs nothing. Setting NET_USAGE_LAN_NOISE=1
+# counts it again, for whoever is measuring the wire rather than the machine.
+NH_FILTER=(-f 'not (ether multicast or ether broadcast)')
+if [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ]; then NH_FILTER=(); fi
 
 # Rows longer than this are refused unread. A process name is really the whole
 # command line, and an Electron app's runs to 700 characters; something far
@@ -143,6 +156,14 @@ function appname(nm, pid,   parts, k, first, path, line) {
   return first
 }
 
+# nethogs reports what it could not place as two rows of its own, "unknown TCP"
+# and "unknown UDP", and the distinction is worth keeping. TCP that nobody owns
+# is almost always a container's traffic crossing the NAT; UDP that nobody owns
+# is almost always chatter the card received and the kernel dropped.
+function unknownBucket(nm) {
+  return (nm ~ /UDP/) ? UNK_UDP : UNK_TCP
+}
+
 function refresh(   line, f, n, seen) {
   # One helper call answers three questions: has the default route moved, has
   # the day rolled over, and what have the containers transferred.
@@ -166,32 +187,45 @@ function refresh(   line, f, n, seen) {
   close(HELPER " probe")
 }
 
-function emit(   a, cUp, cDown, unUp, unDown) {
+function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
   printf "snap\t%s\n", curDay
 
-  # Container bytes cross the uplink too, so nethogs has already counted them
-  # once inside its unattributed bucket. Naming them here and leaving the
-  # bucket untouched would report the same traffic twice.
   cUp = 0; cDown = 0
   for (a in ctrSeen) { cUp += ctrTx[a]; cDown += ctrRx[a] }
 
   for (a in accUp) {
-    if (a == "(unattributed)") continue
+    if (a == UNK_TCP || a == UNK_UDP) continue
     printf "row\t%.0f\t%.0f\tproc\t%s\n", accUp[a], accDown[a], a
   }
   for (a in ctrSeen)
     printf "row\t%.0f\t%.0f\tcontainer\t%s\n", ctrTx[a], ctrRx[a], a
 
-  unUp = accUp["(unattributed)"] - cUp;     if (unUp < 0)   unUp = 0
-  unDown = accDown["(unattributed)"] - cDown; if (unDown < 0) unDown = 0
-  if (unUp > 0 || unDown > 0)
-    printf "row\t%.0f\t%.0f\tunattributed\t%s\n", unUp, unDown, "(unattributed)"
+  # Container bytes cross the uplink NAT'd, with no socket on this side of the
+  # namespace, so nethogs has already counted every one of them once under
+  # "unknown TCP". Naming the container above and leaving that bucket alone
+  # would report the same traffic twice. Take it back out of TCP, and spill
+  # into UDP only for the container that spoke QUIC.
+  tUp = accUp[UNK_TCP]; tDown = accDown[UNK_TCP]
+  uUp = accUp[UNK_UDP]; uDown = accDown[UNK_UDP]
+
+  d = (cUp   < tUp)   ? cUp   : tUp;   tUp   -= d; cUp   -= d
+  d = (cDown < tDown) ? cDown : tDown; tDown -= d; cDown -= d
+  uUp   -= cUp;   if (uUp < 0)   uUp = 0
+  uDown -= cDown; if (uDown < 0) uDown = 0
+
+  if (tUp > 0 || tDown > 0)
+    printf "row\t%.0f\t%.0f\tunattributed\t%s\n", tUp, tDown, UNK_TCP
+  if (uUp > 0 || uDown > 0)
+    printf "row\t%.0f\t%.0f\tunattributed\t%s\n", uUp, uDown, UNK_UDP
 
   print "end"
   fflush()
 }
 
-BEGIN { rows = 0; sinceProbe = PROBE_EVERY; curDay = ""; curIface = IFACE }
+BEGIN {
+  rows = 0; sinceProbe = PROBE_EVERY; curDay = ""; curIface = IFACE
+  UNK_TCP = "(unknown TCP)"; UNK_UDP = "(unknown UDP)"
+}
 
 # A snapshot boundary. Everything gathered since the last one is now complete.
 /^Refreshing:/ {
@@ -231,7 +265,7 @@ length($0) > MAX_LINE { next }
   dd = down - lastDown[key]; if (dd < 0) dd = down
   lastUp[key] = up; lastDown[key] = down
 
-  a = (pid + 0 == 0) ? "(unattributed)" : appname(name, pid)
+  a = (pid + 0 == 0) ? unknownBucket(name) : appname(name, pid)
   accUp[a] += du; accDown[a] += dd
 }
 
@@ -242,7 +276,7 @@ SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
 
 run_accumulator() {
   local iface=$1 interval=$2 probe_every=$3
-  "$NETHOGS" -t -C -v 2 -d "$interval" "$iface" 2>/dev/null |
+  "$NETHOGS" -t -C -v 2 -d "$interval" "${NH_FILTER[@]}" "$iface" 2>/dev/null |
     awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE"
 }
@@ -282,7 +316,7 @@ top() {
 
   printf 'Watching %s for %ss...\n\n' "$iface" "$secs"
   local rows
-  rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "$iface" 2>/dev/null |
+  rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" "$iface" 2>/dev/null |
     awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY=3 \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE" |
     awk '/^snap/ { buf = "" } /^row/ { buf = buf $0 "\n" } END { printf "%s", buf }')
@@ -299,14 +333,89 @@ top() {
     done
 }
 
+# The chart can say how many bytes it failed to trace to an app. It cannot say
+# what they were: nethogs knows nothing about a packet beyond which socket, if
+# any, owns it. This does. It re-runs the capture behind a series of pcap
+# filters and reports how the traffic divides up, which is almost always enough
+# to recognise an untraceable lump on sight. Slow by nature — every filter
+# needs a capture window of its own.
+bytes_matching() {
+  local iface=$1 secs=$2 filt=$3
+  # Two refreshes: the first arrives empty because nethogs has nothing to
+  # report yet, the second carries the window's running total per row.
+  timeout "$((secs * 2 + 4))" \
+    "$NETHOGS" -t -C -v 2 -d "$secs" -c 2 -f "$filt" "$iface" 2>/dev/null |
+    awk -F'\t' 'NF == 3 { d[$1] = $3 + 0 }
+                END { s = 0; for (k in d) s += d[k]; printf "%.0f\n", s }'
+}
+
+explain() {
+  local secs=${1:-4} iface total got pct i
+  [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
+  iface=$(default_iface) || true
+  [ -n "$iface" ] || die "no default route: nothing to watch"
+
+  local labels=(
+    "everything"
+    "not addressed to this host"
+    "  mDNS / Bonjour (5353)"
+    "  NetBIOS (137, 138)"
+    "  SSDP / UPnP (1900)"
+    "QUIC (udp 443)"
+  )
+  local filters=(
+    "ip or ip6"
+    "ether multicast or ether broadcast"
+    "udp port 5353"
+    "udp port 137 or udp port 138"
+    "udp port 1900"
+    "udp port 443"
+  )
+
+  # A global, not a local: the trap outlives the function that sets it, and
+  # under `set -u` a dead local would abort the cleanup it was written to do.
+  NH_TMP=$(mktemp -d) || die "cannot create a temporary directory"
+  trap 'rm -rf "${NH_TMP:-}"' EXIT INT TERM
+
+  printf 'Sampling %s behind %d filters at once, for %ss.\n\n' \
+    "$iface" "${#filters[@]}" "$((secs * 2))"
+
+  # All of them share one window. Run one after another and each measures a
+  # different few seconds of a machine whose traffic comes in bursts, so a
+  # subset can out-measure the set it belongs to and the shares stop adding up.
+  for i in "${!filters[@]}"; do
+    bytes_matching "$iface" "$secs" "${filters[$i]}" > "$NH_TMP/$i" &
+  done
+  wait
+
+  total=$(cat "$NH_TMP/0" 2>/dev/null)
+  printf '%-30s %12s %6s\n' "ARRIVING ON THE WIRE" "DOWN" "SHARE"
+  for i in "${!filters[@]}"; do
+    got=$(cat "$NH_TMP/$i" 2>/dev/null)
+    pct=$(awk -v g="${got:-0}" -v t="${total:-0}" \
+      'BEGIN { printf "%d", (t > 0 ? 100 * g / t : 0) }')
+    printf '%-30s %12s %5s%%\n' "${labels[$i]}" "$(human "${got:-0}")" "$pct"
+  done
+
+  printf '\n'
+  if [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ]; then
+    printf 'The chart is counting the rows nothing on this machine asked for,\n'
+    printf 'so they will keep arriving as one large unnamed bar.\n'
+  else
+    printf 'The chart leaves out what was not addressed to this host: no socket\n'
+    printf 'owns those bytes, so they can never carry an app name.\n'
+  fi
+}
+
 case "${1:-top}" in
   stream)  shift; stream "$@" ;;
   top)     shift; top "$@" ;;
+  explain) shift; explain "$@" ;;
   probe)   probe ;;
   doctor)  doctor ;;
   -V|--version) printf 'net-usage %s\n' "$VERSION" ;;
   -h|--help)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command '${1}' — try: top, stream, probe, doctor" ;;
 esac
