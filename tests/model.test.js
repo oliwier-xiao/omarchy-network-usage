@@ -87,7 +87,7 @@ const DAY = {
   apps: {
     curl: { up: 100, down: 2000, kind: "proc" },
     "webae-postgres": { up: 50, down: 900, kind: "container" },
-    "(unattributed)": { up: 0, down: 60, kind: "unattributed" },
+    "(unknown UDP)": { up: 0, down: 60, kind: "unattributed" },
     chatty: { up: 150, down: 40, kind: "proc" },
     silent: { up: 0, down: 0, kind: "proc" }
   }
@@ -95,7 +95,7 @@ const DAY = {
 
 test("appList ranks by the direction asked for and drops empty rows", () => {
   const down = Model.appList(DAY, "down")
-  assert.deepEqual(down.map(r => r.name), ["curl", "webae-postgres", "(unattributed)", "chatty"])
+  assert.deepEqual(down.map(r => r.name), ["curl", "webae-postgres", "(unknown UDP)", "chatty"])
   const up = Model.appList(DAY, "up")
   assert.equal(up[0].name, "chatty", "upload ranks differently from download")
 })
@@ -146,8 +146,36 @@ test("formatDate names the recent days and dates the rest", () => {
 
 test("attributionNote stays quiet below one percent", () => {
   assert.equal(Model.attributionNote(Model.appList(DAY, "down"), 3000), "2% could not be traced to an app")
-  const tiny = { up: 0, down: 10000, apps: { "(unattributed)": { up: 0, down: 1, kind: "unattributed" } } }
+  const tiny = { up: 0, down: 10000, apps: { "(unknown UDP)": { up: 0, down: 1, kind: "unattributed" } } }
   assert.equal(Model.attributionNote(Model.appList(tiny, "down"), 10000), "")
+})
+
+// The gap arrives as one row per protocol. Reporting the larger of the two
+// would quietly halve the number the line exists to be honest about.
+test("attributionNote adds the unknown buckets together", () => {
+  const split = {
+    up: 0, down: 1000,
+    apps: {
+      curl: { up: 0, down: 800, kind: "proc" },
+      "(unknown TCP)": { up: 0, down: 120, kind: "unattributed" },
+      "(unknown UDP)": { up: 0, down: 80, kind: "unattributed" }
+    }
+  }
+  const rows = Model.appList(split, "down")
+  assert.equal(Model.attributionNote(rows, 1000), "20% could not be traced to an app")
+})
+
+test("both unknown buckets hide together", () => {
+  const split = {
+    up: 0, down: 1000,
+    apps: {
+      curl: { up: 0, down: 800, kind: "proc" },
+      "(unknown TCP)": { up: 0, down: 120, kind: "unattributed" },
+      "(unknown UDP)": { up: 0, down: 80, kind: "unattributed" }
+    }
+  }
+  const rows = Model.topRows(Model.appList(split, "down"), 10, "down", false)
+  assert.deepEqual(rows.map(r => r.name), ["curl"])
 })
 
 test("dayFor falls back to an empty day rather than undefined", () => {
