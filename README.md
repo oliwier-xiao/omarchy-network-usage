@@ -220,6 +220,17 @@ The history file is state, not config — numbers the machine produced rather th
 set. If it is ever unreadable it is moved aside once as `history.json.broken` and counting starts
 again, rather than the day being lost to a parse error.
 
+The shell never opens it. `omarchy-shell` is one process for every plugin on the desktop, so the
+file is opened once in a child process, with the flags that refuse a symlink outright and decline
+to wait on a pipe, and its type, its owner and its length are then read off that one descriptor
+rather than off the name — which anything else running as you can change between one look and the
+next. Something too large is refused whole rather than cut down to the ceiling: half a document is
+not a shorter history, it is a parse error wearing one.
+
+Nor is it written by the shell. The replacement is built beside it under a name that the open
+either creates or fails on, and then renamed over the old one — so a link left at `history.json`
+is what gets replaced, and whatever it pointed at is never opened.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
