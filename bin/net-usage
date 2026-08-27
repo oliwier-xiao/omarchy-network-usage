@@ -51,6 +51,24 @@ MAX_LINE=4096
 # And a snapshot with more rows than this is a runaway, not a busy machine.
 MAX_ROWS=2000
 
+# Those two bound one snapshot. They do not bound the accumulator, which is the
+# thing the shell actually reads: it keeps a running total per program name and
+# reprints all of them on every sample, so a churn of short-lived programs with
+# fresh names makes each sample larger than the last, for ever. Measured before
+# this ceiling existed: 500 new names per snapshot took one sample from nothing
+# to 290 KB in twenty snapshots, still climbing, into the shell the whole desktop
+# shares. Past this many distinct programs the rest are summed into one row, so
+# the totals stay honest and the width stops growing.
+MAX_APPS=512
+# Cut where the name is made rather than where it is stored. The QML side cuts to
+# the same length; doing it here means the bytes never travel at all.
+MAX_NAME=128
+# The per-process-instance totals are what deltas are measured against, so they
+# cannot simply be dropped. Past this many the accumulator stands down instead
+# and the caller starts a fresh one, which is the same rebase the day turning
+# already performs.
+MAX_KEYS=8000
+
 die() { printf 'net-usage: %s\n' "$*" >&2; exit 1; }
 
 # The interface carrying the default route. Monitoring every interface instead
@@ -164,7 +182,7 @@ function appname(nm, pid,   parts, k, first, path, line) {
     if ((getline line < path) > 0 && line != "") first = line
     close(path)
   }
-  return first
+  return substr(first, 1, MAX_NAME)
 }
 
 # nethogs reports what it could not place as two rows of its own, "unknown TCP"
@@ -175,7 +193,7 @@ function unknownBucket(nm) {
   return (nm ~ /UDP/) ? UNK_UDP : UNK_TCP
 }
 
-function refresh(   line, f, n, seen) {
+function refresh(   line, f, n, seen, nm, i, gone) {
   # One helper call answers three questions: has the default route moved, has
   # the day rolled over, and what have the containers transferred.
   delete ctrSeen
@@ -184,7 +202,7 @@ function refresh(   line, f, n, seen) {
     if (n >= 2 && f[1] == "iface") { curIface = f[2]; continue }
     if (n >= 2 && f[1] == "day")   { curDay = f[2];   continue }
     if (n >= 4 && f[1] == "ctr") {
-      nm = f[2]
+      nm = substr(f[2], 1, MAX_NAME)
       if (!(nm in ctrBaseRx)) { ctrBaseRx[nm] = f[3] + 0; ctrBaseTx[nm] = f[4] + 0 }
       # A container that restarts resets its counters; rebase rather than
       # subtract a larger number from a smaller one.
@@ -196,6 +214,16 @@ function refresh(   line, f, n, seen) {
     }
   }
   close(HELPER " probe")
+
+  # A container that is gone takes its baseline with it. Keeping them is what
+  # turns a churn of short-lived containers into a map that only ever grows.
+  n = 0
+  for (nm in ctrBaseRx) if (!(nm in ctrSeen)) gone[++n] = nm
+  for (i = 1; i <= n; i++) {
+    delete ctrBaseRx[gone[i]]; delete ctrBaseTx[gone[i]]
+    delete ctrRx[gone[i]];     delete ctrTx[gone[i]]
+    delete gone[i]
+  }
 }
 
 function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
@@ -235,6 +263,7 @@ function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
 
 BEGIN {
   rows = 0; sinceProbe = PROBE_EVERY; curDay = ""; curIface = IFACE
+  nApps = 0; nKeys = 0; OTHER = "(other apps)"
   UNK_TCP = "(unknown TCP)"; UNK_UDP = "(unknown UDP)"
 }
 
@@ -247,6 +276,7 @@ BEGIN {
   if (curIface != "" && curIface != IFACE) exit 0
   if (startDay == "") startDay = curDay
   if (curDay != "" && curDay != startDay) exit 0
+  if (nKeys > MAX_KEYS) exit 0
   if (started) emit()
   started = 1
   rows = 0
@@ -274,9 +304,17 @@ length($0) > MAX_LINE { next }
   key = F[1]
   du = up - lastUp[key];   if (du < 0) du = up
   dd = down - lastDown[key]; if (dd < 0) dd = down
+  if (!(key in lastUp)) nKeys++
   lastUp[key] = up; lastDown[key] = down
 
   a = (pid + 0 == 0) ? unknownBucket(name) : appname(name, pid)
+  # Past the ceiling the bytes are still counted, just not under a name of their
+  # own. Dropping them instead would make the totals quietly wrong, which is a
+  # worse answer than one honest row saying the rest were too many to draw.
+  if (!(a in accUp)) {
+    if (nApps >= MAX_APPS) a = OTHER
+    else nApps++
+  }
   accUp[a] += du; accDown[a] += dd
 }
 
@@ -289,7 +327,9 @@ run_accumulator() {
   local iface=$1 interval=$2 probe_every=$3
   "$NETHOGS" -t -C -v 2 -d "$interval" "${NH_FILTER[@]}" "$iface" 2>/dev/null |
     awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
-        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE"
+        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
+        -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
+        -- "$ACCUMULATE"
 }
 
 # Long-lived. Restarts nethogs when the accumulator stands down, which it does
@@ -329,7 +369,9 @@ top() {
   local rows
   rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" "$iface" 2>/dev/null |
     awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY=3 \
-        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" -- "$ACCUMULATE" |
+        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
+        -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
+        -- "$ACCUMULATE" |
     awk '/^snap/ { buf = "" } /^row/ { buf = buf $0 "\n" } END { printf "%s", buf }')
 
   [ -n "$rows" ] || { printf 'Nothing moved.\n'; return 0; }
