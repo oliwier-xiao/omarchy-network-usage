@@ -60,8 +60,28 @@ Item {
 
   // ------------------------------------------------------------- accumulate
 
-  function noteRow(row) {
-    if (!row) return
+  // Every write to `days` replaces the objects it touches instead of editing
+  // them, and that is load-bearing rather than a matter of taste. QML does not
+  // re-signal a `var` property whose binding re-evaluates to the same object
+  // reference it already held, and `today` is exactly such a binding — it
+  // reads `days[todayKey]`. Editing that day in place therefore left `today`,
+  // `todayDown`, `todayUp` and every chart in the panel pinned to the values
+  // the day was created with, while the collector ran, the deltas landed and
+  // the history file grew: a panel reading 0 B on top of a working counter.
+  // Publishing a new object makes the reference differ, which is the only
+  // thing the binding actually watches.
+  function replaceDay(key, day) {
+    var next = {}
+    for (var k in root.days) next[k] = root.days[k]
+    next[key] = day
+    root.days = next
+    root.pendingWrite = true
+  }
+
+  // Folds one row's delta into `day`, a copy owned by the caller. Returns
+  // whether anything actually moved, so a quiet snapshot publishes nothing.
+  function noteRow(row, day) {
+    if (!row) return false
     var prev = root.lastSeen[row.name]
     var dUp, dDown
     if (prev === undefined) {
@@ -76,26 +96,20 @@ Item {
       if (dDown < 0) dDown = row.down
     }
     root.lastSeen[row.name] = { up: row.up, down: row.down }
-    if (dUp <= 0 && dDown <= 0) return
+    if (dUp <= 0 && dDown <= 0) return false
 
-    var key = root.todayKey
-    if (!key) return
-    // Read-modify-write the whole day object. Mutating in place would leave
-    // the adapter unaware that anything changed, and nothing would ever be
-    // written — a failure that looks perfectly healthy until the shell
-    // restarts and the day is gone.
-    var day = root.days[key] || Model.emptyDay()
-    var apps = day.apps || {}
-    var app = apps[row.name] || { up: 0, down: 0, kind: row.kind }
-    app.up = (Number(app.up) || 0) + dUp
-    app.down = (Number(app.down) || 0) + dDown
-    app.kind = row.kind
-    apps[row.name] = app
-    day.apps = apps
+    // A fresh app record too: the table was shallow-copied from the previous
+    // day object, so editing this one would reach back into the record the
+    // panel is still holding.
+    var prevApp = day.apps[row.name]
+    day.apps[row.name] = {
+      up: (prevApp ? Number(prevApp.up) || 0 : 0) + dUp,
+      down: (prevApp ? Number(prevApp.down) || 0 : 0) + dDown,
+      kind: row.kind
+    }
     day.up = (Number(day.up) || 0) + dUp
     day.down = (Number(day.down) || 0) + dDown
-    root.days[key] = day
-    root.pendingWrite = true
+    return true
   }
 
   property bool pendingWrite: false
@@ -104,21 +118,34 @@ Item {
   function rollTo(key) {
     if (!key || key === root.todayKey) return
     root.todayKey = key
-    if (!root.days[key]) {
-      root.days[key] = Model.emptyDay()
-      root.pendingWrite = true
-    }
+    if (!root.days[key]) root.replaceDay(key, Model.emptyDay())
     // A new day is a new counting origin; the collector restarts too, but say
     // so here as well so a clock jump cannot fold yesterday into today.
     root.lastSeen = ({})
-    root.daysChanged()
   }
 
   function commitSnapshot() {
     var rows = root.pendingRows
     root.pendingRows = []
-    for (var i = 0; i < rows.length; i++) root.noteRow(rows[i])
-    if (rows.length > 0) root.daysChanged()
+    var key = root.todayKey
+    if (rows.length === 0 || !key) return
+
+    // One copy per snapshot rather than per row: the day and its app table are
+    // rebuilt once, every row is folded into that copy, and the result is
+    // published in a single assignment.
+    var prevDay = root.days[key] || Model.emptyDay()
+    var day = {
+      up: Number(prevDay.up) || 0,
+      down: Number(prevDay.down) || 0,
+      apps: {}
+    }
+    var prevApps = prevDay.apps || {}
+    for (var name in prevApps) day.apps[name] = prevApps[name]
+
+    var moved = false
+    for (var i = 0; i < rows.length; i++)
+      if (root.noteRow(rows[i], day)) moved = true
+    if (moved) root.replaceDay(key, day)
   }
 
   // ------------------------------------------------------------- collector
