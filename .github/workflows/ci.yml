@@ -26,10 +26,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax check
         run: bash -n bin/net-usage
+      # shellcheck ships on the GitHub Ubuntu runner image. Installing it here
+      # would put a privileged package-manager call in the repository, which the
+      # marketplace security baseline reads and reports against the plugin.
       - name: Shellcheck
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning bin/net-usage || true
+        run: shellcheck -S warning bin/net-usage || true
 
   manifest:
     name: manifest shape
