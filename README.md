@@ -2,6 +2,8 @@
 
 Which apps used your bandwidth, one click from your Omarchy bar.
 
+![The Network Usage panel: today's download and upload, ranked by app](preview.png)
+
 Two ranked bar charts — one for what came down, one for what went up — and a day of history
 behind them. When a gigabyte went somewhere this afternoon, this is the thing that says where.
 
@@ -17,6 +19,18 @@ its own binary the capabilities it needs when it installs, and the plugin never 
 ---
 
 ## Install
+
+**1. Install `nethogs`.** Nothing else on a stock Arch box attributes wire bytes to a process, so
+the plugin has nothing to count without it — the kernel does not keep that score per app.
+
+```bash
+omarchy pkg add nethogs
+```
+
+No sudo or pkexec is needed afterwards: the package grants its own binary the capabilities it
+needs at install time, and the plugin never asks for more.
+
+**2. Add the plugin.**
 
 ```bash
 omarchy plugin add https://github.com/oliwier-xiao/omarchy-network-usage.git --enable
@@ -73,7 +87,7 @@ is lost if the two hues read the same to you.
 | Setting | Default | What it does |
 |---|---|---|
 | Next to the bar icon | Download | `Download`, `Both directions`, or `Nothing`. Both roughly doubles the width. |
-| Apps per chart | 8 | Bars drawn before the rest are summed into one row. |
+| Apps per chart | 8 | Bars drawn before the rest are summed into one row. Click that row, or press `e`, to list them all. |
 | Name container traffic | on | Reads each container's own byte counters and puts a name on them. |
 | Show what could not be attributed | on | Keeps the chart honest about the size of the gap. |
 | Sample every | 2s | A battery setting, not an accuracy one. |
@@ -91,12 +105,18 @@ omarchy bar move oliwier.network-usage --section right
 
 | Key | Does |
 |---|---|
-| `d`, `↑`, `↓` | Step through the last seven days |
+| `↑`, `↓` | Scroll the panel |
+| `e` | List every app, or fold the tail back up |
+| `d` | Step through the last seven days |
 | `t` | Back to today |
 | `Tab` | Next panel |
 | `Esc` | Close |
 
 Clicking a day in the footer strip pins it; clicking today unpins.
+
+The last row of each chart sums whatever did not fit — click it to list every app instead, and
+**show fewer** to fold it back. Expanded charts are usually taller than the panel, which is what
+the scrolling is for.
 
 ## From a terminal
 
