@@ -10,6 +10,7 @@
 #   net-usage top [n]        one snapshot, human-readable. Run it yourself.
 #   net-usage stream [secs]  long-lived TSV for the bar widget
 #   net-usage explain [s]    what the untraceable bytes actually were
+#   net-usage history        the saved history file, bounded and type-checked
 #   net-usage probe          interface, date and container counters, once
 #   net-usage doctor         is anything missing, and what to do about it
 #
@@ -32,6 +33,15 @@ NETHOGS=/usr/bin/nethogs
 # counts it again, for whoever is measuring the wire rather than the machine.
 NH_FILTER=(-f 'not (ether multicast or ether broadcast)')
 if [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ]; then NH_FILTER=(); fi
+
+# The shell this plugin runs inside is shared with the whole desktop, and
+# Quickshell's FileView will hand it whatever is at a path with no ceiling on
+# how much it reads. The history file sits at a predictable location in a
+# directory every process running as this user can write to, so it is read
+# here instead — in a child process, through a descriptor checked after it is
+# open, and never more than this many bytes. 90 days of a busy machine is
+# well under a megabyte.
+MAX_HISTORY=$((8 * 1024 * 1024))
 
 # Rows longer than this are refused unread. A process name is really the whole
 # command line, and an Electron app's runs to 700 characters; something far
@@ -407,15 +417,41 @@ explain() {
   fi
 }
 
+history_path() {
+  printf '%s/.local/state/omarchy/network-usage/history.json' "${HOME:-}"
+}
+
+# Three guards, because each one alone is insufficient. The type test refuses a
+# FIFO before the open, which would otherwise block with no descriptor yet to
+# inspect. The descriptor test then re-checks what was actually opened, which a
+# path swapped in between cannot change. And head bounds the read regardless of
+# what either test concluded — that last one is the guard that holds even if
+# the other two are raced.
+history_read() {
+  local f
+  f=$(history_path)
+  [ -n "$f" ] || return 0
+  [ -f "$f" ] || return 0
+  if [ -L "$f" ]; then return 0; fi
+
+  exec 3< "$f" 2>/dev/null || return 0
+  if [ -f /dev/fd/3 ]; then
+    head -c "$MAX_HISTORY" <&3
+  fi
+  exec 3<&-
+  return 0
+}
+
 case "${1:-top}" in
   stream)  shift; stream "$@" ;;
   top)     shift; top "$@" ;;
   explain) shift; explain "$@" ;;
+  history) history_read ;;
   probe)   probe ;;
   doctor)  doctor ;;
   -V|--version) printf 'net-usage %s\n' "$VERSION" ;;
   -h|--help)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "unknown command '${1}' — try: top, stream, probe, doctor" ;;
+  *) die "unknown command '${1}' — try: top, stream, explain, history, probe, doctor" ;;
 esac
