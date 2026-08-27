@@ -154,6 +154,8 @@ omarchy bar move oliwier.network-usage --section right
 | `Tab` | Next panel |
 | `Esc` | Close |
 
+![The day strip and key hints along the bottom of the panel](docs/history.png)
+
 Clicking a day in the footer strip pins it; clicking today unpins.
 
 The last row of each chart sums whatever did not fit — click it to list every app instead, and
