@@ -183,3 +183,81 @@ test("dayFor falls back to an empty day rather than undefined", () => {
   assert.equal(empty.down, 0)
   assert.deepEqual(empty.apps, {})
 })
+
+// ---------------------------------------------------------------- hardening
+
+test("capApps keeps the busiest names and folds the rest without losing bytes", () => {
+  const apps = {}
+  for (let i = 0; i < 250; i++) apps["app" + i] = { up: i, down: i * 2, kind: "proc" }
+  const day = { up: 31125, down: 62250, apps }
+  const capped = Model.capApps(day, 100)
+
+  assert.equal(Object.keys(capped.apps).length, 101, "100 names plus one overflow row")
+  assert.ok(capped.apps["app249"], "the busiest survived")
+  assert.equal(capped.apps["app0"], undefined, "the quietest did not")
+
+  const sum = Object.values(capped.apps).reduce((t, r) => t + r.up + r.down, 0)
+  const before = Object.values(apps).reduce((t, r) => t + r.up + r.down, 0)
+  assert.equal(sum, before, "capping moves bytes, it never drops them")
+})
+
+test("capApps accumulates into an overflow row that already exists", () => {
+  const apps = { "(other apps)": { up: 1000, down: 2000, kind: "other" } }
+  for (let i = 0; i < 10; i++) apps["app" + i] = { up: 1, down: 1, kind: "proc" }
+  const capped = Model.capApps({ up: 0, down: 0, apps }, 5)
+  assert.equal(capped.apps["(other apps)"].up, 1000 + 5, "the old sum is carried, not replaced")
+})
+
+test("capApps leaves a day that fits completely alone", () => {
+  const day = { up: 1, down: 2, apps: { curl: { up: 1, down: 2, kind: "proc" } } }
+  assert.equal(Model.capApps(day, 100), day, "same object back, no needless copy")
+})
+
+test("sanitizeStore drops everything that is not a plausible record", () => {
+  const store = Model.sanitizeStore({
+    "2026-08-27": { up: 5, down: 6, apps: { curl: { up: 5, down: 6, kind: "proc" } } },
+    "not-a-date": { up: 1, down: 1, apps: {} },
+    "2026-08-26": "a string where a day should be",
+    "2026-08-25": { up: -9, down: NaN, apps: {
+      ok: { up: 1, down: 1, kind: "proc" },
+      negative: { up: -5, down: 1, kind: "proc" },
+      infinite: { up: Infinity, down: 1, kind: "proc" },
+      notAnObject: 42
+    } }
+  }, 400, 100)
+
+  assert.deepEqual(Object.keys(store).sort(), ["2026-08-25", "2026-08-27"])
+  assert.equal(store["2026-08-27"].apps.curl.down, 6)
+  assert.deepEqual(Object.keys(store["2026-08-25"].apps), ["ok"], "only the sane row survives")
+  assert.equal(store["2026-08-25"].up, 0, "a negative total reads as zero, not as itself")
+  assert.equal(store["2026-08-25"].down, 0, "NaN reads as zero")
+})
+
+test("sanitizeStore keeps the most recent days when there are too many", () => {
+  const raw = {}
+  for (let d = 1; d <= 28; d++) {
+    const key = "2026-02-" + String(d).padStart(2, "0")
+    raw[key] = { up: d, down: d, apps: {} }
+  }
+  const store = Model.sanitizeStore(raw, 5, 100)
+  assert.deepEqual(Object.keys(store).sort(), [
+    "2026-02-24", "2026-02-25", "2026-02-26", "2026-02-27", "2026-02-28"
+  ])
+})
+
+test("sanitizeStore survives the shapes a hostile file would actually take", () => {
+  assert.deepEqual(Model.sanitizeStore(null, 400, 100), {})
+  assert.deepEqual(Model.sanitizeStore("a string", 400, 100), {})
+  assert.deepEqual(Model.sanitizeStore(12345, 400, 100), {})
+  assert.deepEqual(Model.sanitizeStore([], 400, 100), {})
+  assert.deepEqual(Model.sanitizeStore({ __proto__: { evil: 1 } }, 400, 100), {})
+})
+
+test("sanitizeStore clips a name long enough to be a payload", () => {
+  const apps = {}
+  apps["x".repeat(5000)] = { up: 1, down: 1, kind: "y".repeat(5000) }
+  const store = Model.sanitizeStore({ "2026-08-27": { up: 1, down: 1, apps } }, 400, 100)
+  const name = Object.keys(store["2026-08-27"].apps)[0]
+  assert.equal(name.length, 128)
+  assert.equal(store["2026-08-27"].apps[name].kind.length, 32)
+})
