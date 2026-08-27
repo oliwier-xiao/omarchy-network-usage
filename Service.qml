@@ -274,6 +274,12 @@ Item {
   function save() {
     if (!root.ready) return
     root.days = root.pruneOld(root.days)
+    // Capped on the way out as well as on the way in. This is the only writer,
+    // so it is the place a file that the next read would have to truncate gets
+    // prevented rather than merely detected.
+    var capped = {}
+    for (var k in root.days) capped[k] = Model.capApps(root.days[k], Model.MAX_APPS_PER_DAY)
+    root.days = capped
     historyAdapter.days = root.days
     historyFile.writeAdapter()
     root.pendingWrite = false
@@ -287,18 +293,34 @@ Item {
     onTriggered: if (root.pendingWrite) root.save()
   }
 
+  // Write-only, deliberately. FileView has no ceiling on what it will read and
+  // no way to add one, and the process it would read into is the shell the
+  // whole desktop runs in. Reading is bin/net-usage's job, where it is bounded.
   FileView {
     id: historyFile
     path: root.historyPath
     printErrors: false
     atomicWrites: true
-    onLoaded: root.onHistoryLoaded()
-    onLoadFailed: root.onHistoryLoadFailed()
+    blockAllReads: true
 
     JsonAdapter {
       id: historyAdapter
       property var days: ({})
     }
+  }
+
+  Process {
+    id: historyProc
+    running: false
+    command: ["timeout", "5", root.pluginDir + "/bin/net-usage", "history"]
+    environment: ({ "HOME": root.home })
+
+    stdout: StdioCollector {
+      onStreamFinished: root.onHistoryText(this.text)
+    }
+    // If it never produced a stream at all — missing, killed, refused — the
+    // plugin still has to start, on an empty day rather than not at all.
+    onExited: if (!root.ready) root.onHistoryText("")
   }
 
   function begin() {
@@ -342,20 +364,38 @@ Item {
     return out
   }
 
-  function onHistoryLoaded() {
-    var loaded = historyAdapter.days
-    root.days = root.dropLegacyBucket((loaded && typeof loaded === "object") ? loaded : ({}))
+  // The only way disk contents reach this process. Everything arriving here is
+  // treated as though someone else wrote it, because at this path someone else
+  // could have: parse defensively, validate and cap before use, and never
+  // repair — a record that fails its check is dropped, not guessed at.
+  function onHistoryText(text) {
+    if (root.ready) return
+
+    var raw = null
+    var s = String(text || "")
+    if (s.length > 0) {
+      try {
+        raw = JSON.parse(s)
+      } catch (e) {
+        // Unparseable, which includes the file having been truncated at the
+        // read ceiling. Keep it aside once so it is not silently overwritten.
+        keepBrokenProc.running = true
+        raw = null
+      }
+    }
+
+    var store = (raw && typeof raw === "object" && raw.days && typeof raw.days === "object")
+      ? raw.days
+      : ({})
+    root.days = root.dropLegacyBucket(
+      Model.sanitizeStore(store, Model.MAX_DAYS, Model.MAX_APPS_PER_DAY))
     root.begin()
   }
 
   // A history file that will not parse is not worth losing the day over, but
   // it is also not worth overwriting silently: keep it aside once, then start
   // clean. A missing file is the ordinary first run and says nothing.
-  function onHistoryLoadFailed() {
-    root.days = ({})
-    keepBrokenProc.running = true
-    root.begin()
-  }
+
 
   Process {
     id: keepBrokenProc
@@ -369,9 +409,16 @@ Item {
   Process {
     id: ensureDirProc
     running: true
-    command: ["mkdir", "-p", "-m", "700", root.dataDir]
+    // `mkdir -m` sets the mode only on directories it actually creates, so one
+    // that already exists keeps whatever it had — including a mode an older
+    // version, a restored backup or a stray umask left readable to everyone.
+    // Creating it and securing it are two statements, not one.
+    command: ["sh", "-c",
+      "d=\"$1\"; mkdir -p -m 700 -- \"$d\" 2>/dev/null || exit 0; " +
+      "[ -L \"$d\" ] || chmod 700 -- \"$d\" 2>/dev/null; exit 0",
+      "sh", root.dataDir]
     environment: ({ "HOME": root.home })
-    onExited: historyFile.reload()
+    onExited: historyProc.running = true
   }
 
   // Midnight, a resume from suspend, or a clock jump all land here.
