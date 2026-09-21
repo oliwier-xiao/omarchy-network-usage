@@ -17,7 +17,9 @@ jobs:
       - name: Syntax check
         run: node --check lib/Model.js && node --check lib/Palette.js
       - name: Unit tests
-        run: node --test tests/
+        # Explicit files: bare `node --test tests/` treats the directory as a
+        # test file on some node versions and fails the whole run.
+        run: node --test tests/model.test.js tests/palette.test.js tests/wire.test.js
 
   shell:
     name: collector checks
@@ -26,6 +28,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax check
         run: bash -n bin/net-usage
+      - name: Fixture test (validate, offline, no nethogs needed)
+        run: ./tests/validate-fixture.sh
       # shellcheck ships on the GitHub Ubuntu runner image. Installing it here
       # would put a privileged package-manager call in the repository, which the
       # marketplace security baseline reads and reports against the plugin.

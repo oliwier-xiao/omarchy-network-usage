@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "oliwier.network-usage",
   "name": "Network Usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "oliwier-xiao",
   "license": "MIT",
   "description": "Which apps used your bandwidth, in bytes, with a day of history behind it. Two ranked bar charts — one for what came down, one for what went up — measured at packet level, so QUIC and UDP count too, and traffic from a container arrives under the container's name instead of a hole in the numbers.",

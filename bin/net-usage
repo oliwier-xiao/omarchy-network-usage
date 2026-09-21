@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-VERSION=1.1.0
+VERSION=1.2.0
 NETHOGS=/usr/bin/nethogs
 
 # The uplink also carries the whole subnet's broadcast and multicast chatter —
@@ -197,7 +197,9 @@ function unknownBucket(nm) {
 function refresh(   line, f, n, seen, nm, i, gone) {
   # One helper call answers three questions: has the default route moved, has
   # the day rolled over, and what have the containers transferred.
-  delete ctrSeen
+  # Element-wise: `delete array` without a subscript is a gawk extension
+  # that mawk rejects, and this same program runs under the CI runner's awk.
+  for (nm in ctrSeen) delete ctrSeen[nm]
   while ((HELPER " probe" | getline line) > 0) {
     n = split(line, f, "\t")
     if (n >= 2 && f[1] == "iface") { curIface = f[2]; continue }
