@@ -22,7 +22,8 @@ BarWidget {
   readonly property bool serviceReady: service && service.ready === true
 
   readonly property string labelMode: String(setting("barLabel", "Download"))
-  readonly property double down: serviceReady ? service.todayDown : 0
+  readonly property string divergenceNote: serviceReady ? Model.divergenceNote(service.today) : ""
+  readonly property double down: serviceReady ? (divergenceNote !== "" ? Model.wireDown(service.today) : service.todayDown) : 0
   readonly property double up: serviceReady ? service.todayUp : 0
   readonly property bool available: serviceReady && service.available === true
 

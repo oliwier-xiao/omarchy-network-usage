@@ -1,0 +1,12 @@
+Adding local address: 10.48.23.73
+Ethernet link detected
+Refreshing:
+unknown TCP/0/0	1000	2000
+chromium/1234/1000	500	1000
+
+Refreshing:
+unknown TCP/0/0	60000	22000000
+chromium/1234/1000	90000	6100000
+curl/5678/1000	30000	1950000
+unknown UDP/0/0	0	50000
+

@@ -67,6 +67,7 @@ Panel {
   readonly property double stripMax: Model.stripMax(root.stripCells)
   readonly property string attributionNote: root.serviceReady
     ? Model.attributionNote(Model.appList(root.activeDay, "down"), root.dayDown) : ""
+  readonly property string divergenceNote: root.serviceReady ? Model.divergenceNote(root.activeDay) : ""
 
   // ---- appearance ---------------------------------------------------------
 
@@ -433,7 +434,7 @@ Panel {
               Text {
                 id: downValue
                 textFormat: Text.PlainText
-                text: Model.splitBytes(root.dayDown).value
+                text: Model.splitBytes(root.divergenceNote !== "" ? Model.wireDown(root.activeDay) : root.dayDown).value
                 color: root.contentForeground
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.display
@@ -442,7 +443,7 @@ Panel {
               Text {
                 anchors.baseline: downValue.baseline
                 textFormat: Text.PlainText
-                text: Model.splitBytes(root.dayDown).unit
+                text: Model.splitBytes(root.divergenceNote !== "" ? Model.wireDown(root.activeDay) : root.dayDown).unit
                 color: root.muted
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -517,6 +518,17 @@ Panel {
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
             text: root.attributionNote
+            color: root.veryMuted
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width
+            visible: root.divergenceNote !== ""
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.divergenceNote
             color: root.veryMuted
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption

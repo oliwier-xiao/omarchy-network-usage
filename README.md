@@ -111,6 +111,29 @@ or QUIC that arrived faster than the mapping could keep up.
 
 If either is ever the largest bar, that is worth knowing rather than worth hiding.
 
+## When the router disagrees
+
+A UniFi or router dashboard and this plugin measure different things, so their
+totals legitimately differ. The gateway's DPI undercounts wired traffic it
+never classifies, and it sees WAN-only while the plugin sees the wire,
+LAN traffic included. Meanwhile **(unknown TCP)** — short-lived connections,
+build workers, containers, kernel traffic no socket owns — lands in the
+plugin's totals but in no app's row, which is exactly the gap that opens up
+during something like `npm run build`.
+
+To check which side of the gap you are on:
+
+```bash
+~/.config/omarchy/plugins/oliwier.network-usage/bin/net-usage validate
+```
+
+`validate` counts apps and the kernel side by side over one short window
+(default 5s) and prints
+a verdict: `OK` (counted within 1.5x of the wire), `SUSPECT` (within 2.5x),
+or `OVERSHOOT` (above that — the counted bytes dwarf what the card received).
+`net-usage explain` then breaks the wire side down by pcap filter, which is
+how you find out what an unnamed bar was made of.
+
 ## Two charts, not one
 
 Download and upload are different questions asked of the same list, and you almost always have
@@ -180,6 +203,9 @@ claude                         4.9 KB      65.9 KB  proc
 ```
 
 `net-usage top [rows] [seconds]` watches for a few seconds and ranks what moved.
+`net-usage validate [seconds]` (default 5s) counts apps against the kernel over one window and prints
+a verdict (`OK` / `SUSPECT` / `OVERSHOOT`) — the check to reach for when the plugin's
+total and the router's disagree.
 `net-usage explain [seconds]` breaks the inbound traffic down by pcap filter, which is how you
 find out what an unnamed bar was made of. `net-usage doctor` reports what is missing.
 `net-usage probe` prints the interface, the date and the container counters once.

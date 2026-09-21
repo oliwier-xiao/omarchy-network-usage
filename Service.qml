@@ -58,6 +58,8 @@ Item {
   // Running totals from the current stream, so a restart of the collector is
   // not mistaken for traffic. Cleared whenever the stream stands down.
   property var lastSeen: ({})
+  property var lastKernel: ({})
+  property string lastRestartReason: ""
 
   // ------------------------------------------------------------- accumulate
 
@@ -113,8 +115,22 @@ Item {
     return true
   }
 
+  function noteKers(kers, day) {
+    if (!kers) return false
+    var prev = root.lastKernel[kers.iface]
+    var delta = Model.kersDelta(prev, kers.rx, kers.tx)
+    root.lastKernel[kers.iface] = { rx: kers.rx, tx: kers.tx }
+    if (delta.dRx <= 0 && delta.dTx <= 0) return false
+
+    day.kDown = (day.kDown !== undefined ? Number(day.kDown) || 0 : 0) + delta.dRx
+    day.kUp = (day.kUp !== undefined ? Number(day.kUp) || 0 : 0) + delta.dTx
+    return true
+  }
+
   property bool pendingWrite: false
   property var pendingRows: []
+  property var pendingKers: []
+  property bool fenceNextEnd: false
 
   function rollTo(key) {
     if (!key || key === root.todayKey) return
@@ -123,13 +139,16 @@ Item {
     // A new day is a new counting origin; the collector restarts too, but say
     // so here as well so a clock jump cannot fold yesterday into today.
     root.lastSeen = ({})
+    root.lastKernel = ({})
   }
 
   function commitSnapshot() {
     var rows = root.pendingRows
+    var kersList = root.pendingKers
     root.pendingRows = []
+    root.pendingKers = []
     var key = root.todayKey
-    if (rows.length === 0 || !key) return
+    if ((rows.length === 0 && kersList.length === 0) || !key) return
 
     // One copy per snapshot rather than per row: the day and its app table are
     // rebuilt once, every row is folded into that copy, and the result is
@@ -140,12 +159,18 @@ Item {
       down: Number(prevDay.down) || 0,
       apps: {}
     }
+    if (prevDay.kUp !== undefined) day.kUp = Number(prevDay.kUp) || 0
+    if (prevDay.kDown !== undefined) day.kDown = Number(prevDay.kDown) || 0
+    if (prevDay.restarts !== undefined) day.restarts = Number(prevDay.restarts) || 0
+    
     var prevApps = prevDay.apps || {}
     for (var name in prevApps) day.apps[name] = prevApps[name]
 
     var moved = false
     for (var i = 0; i < rows.length; i++)
       if (root.noteRow(rows[i], day)) moved = true
+    for (var j = 0; j < kersList.length; j++)
+      if (root.noteKers(kersList[j], day)) moved = true
     if (moved) root.replaceDay(key, day)
   }
 
@@ -154,6 +179,7 @@ Item {
   function restartStream() {
     streamProc.running = false
     root.lastSeen = ({})
+    root.lastKernel = ({})
     startTimer.restart()
   }
 
@@ -205,9 +231,51 @@ Item {
           var day = s.split("\t")[1] || ""
           if (day) root.rollTo(day)
           root.pendingRows = []
+          root.pendingKers = []
           return
         }
-        if (s === "end") { root.commitSnapshot(); return }
+        if (s === "end") {
+          if (root.fenceNextEnd) {
+            // The collector emits a final snapshot from its END block after a restart note.
+            // Committing it after a day-roll would double-count the old lifecycle's totals
+            // as fresh deltas. Discard it. If the process dies before 'end', this flag
+            // persists and skips at most one 2s sample from the next run, which is acceptable.
+            root.pendingRows = []
+            root.pendingKers = []
+            root.fenceNextEnd = false
+            return
+          }
+          root.commitSnapshot()
+          return
+        }
+        if (s.indexOf("note\trestart\t") === 0) {
+          root.fenceNextEnd = true
+          var reason = s.split("\t")[2] || ""
+          root.lastRestartReason = reason
+          var key = root.todayKey
+          if (key) {
+            var prevDay = root.days[key] || Model.emptyDay()
+            var newDay = {
+              up: Number(prevDay.up) || 0,
+              down: Number(prevDay.down) || 0,
+              apps: {}
+            }
+            if (prevDay.kUp !== undefined) newDay.kUp = Number(prevDay.kUp) || 0
+            if (prevDay.kDown !== undefined) newDay.kDown = Number(prevDay.kDown) || 0
+            newDay.restarts = (Number(prevDay.restarts) || 0) + 1
+            
+            var prevApps = prevDay.apps || {}
+            for (var name in prevApps) newDay.apps[name] = prevApps[name]
+            root.replaceDay(key, newDay)
+          }
+          return
+        }
+        if (s.indexOf("kers\t") === 0) {
+          if (root.pendingKers.length >= 2000) return
+          var kers = Model.parseKers(s)
+          if (kers) root.pendingKers.push(kers)
+          return
+        }
         if (s.indexOf("row\t") !== 0) return
         if (root.pendingRows.length >= 2000) return
         var row = Model.parseRow(s)
@@ -377,11 +445,15 @@ Item {
       var row = day.apps[LEGACY]
       var apps = {}
       for (var n in day.apps) if (n !== LEGACY) apps[n] = day.apps[n]
-      out[k] = {
+      var newDay = {
         up: Math.max(0, (day.up || 0) - (row.up || 0)),
         down: Math.max(0, (day.down || 0) - (row.down || 0)),
         apps: apps
       }
+      if (day.kUp !== undefined) newDay.kUp = day.kUp
+      if (day.kDown !== undefined) newDay.kDown = day.kDown
+      if (day.restarts !== undefined) newDay.restarts = day.restarts
+      out[k] = newDay
       touched = true
     }
     if (touched) root.pendingWrite = true

@@ -9,6 +9,7 @@
 #
 #   net-usage top [n]        one snapshot, human-readable. Run it yourself.
 #   net-usage stream [secs]  long-lived TSV for the bar widget
+#   net-usage validate [s]   counted-vs-kernel cross-check, reads only
 #   net-usage explain [s]    what the untraceable bytes actually were
 #   net-usage history        the saved history file, bounded and type-checked
 #   net-usage save           replace that file with the store on stdin
@@ -226,8 +227,29 @@ function refresh(   line, f, n, seen, nm, i, gone) {
   }
 }
 
+function kers(   p, line, rest, nf, f, i, j, vals, rx, tx) {
+  # Per-snapshot kernel counters for the monitored interface, read straight
+  # from the file with getline: no fork per snapshot, and zeros when the
+  # interface is absent or the file unreadable. Old readers ignore the line.
+  p = (PROCDEV != "" ? PROCDEV : "/proc/net/dev")
+  rx = 0; tx = 0
+  while ((getline line < p) > 0) {
+    sub(/^[ \t]+/, "", line)
+    if (index(line, IFACE ":") == 1) {
+      rest = substr(line, length(IFACE) + 2)
+      nf = split(rest, f, /[ \t]+/)
+      j = 0
+      for (i = 1; i <= nf; i++) if (f[i] != "") vals[++j] = f[i]
+      if (j >= 9) { rx = vals[1] + 0; tx = vals[9] + 0 }
+    }
+  }
+  close(p)
+  printf "kers\t%s\t%.0f\t%.0f\n", IFACE, rx, tx
+}
+
 function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
   printf "snap\t%s\n", curDay
+  kers()
 
   cUp = 0; cDown = 0
   for (a in ctrSeen) { cUp += ctrTx[a]; cDown += ctrRx[a] }
@@ -273,10 +295,16 @@ BEGIN {
   # The route moving or the day turning both invalidate this nethogs process:
   # it enumerated its interfaces once at startup and its counters are bound to
   # the old day. Exiting drops the pipe, and the caller starts a fresh one.
-  if (curIface != "" && curIface != IFACE) exit 0
+  if (curIface != "" && curIface != IFACE) {
+    printf "note\trestart\troute-moved\n"; fflush(); exit 0
+  }
   if (startDay == "") startDay = curDay
-  if (curDay != "" && curDay != startDay) exit 0
-  if (nKeys > MAX_KEYS) exit 0
+  if (curDay != "" && curDay != startDay) {
+    printf "note\trestart\tday-rolled\n"; fflush(); exit 0
+  }
+  if (nKeys > MAX_KEYS) {
+    printf "note\trestart\tkey-ceiling\n"; fflush(); exit 0
+  }
   if (started) emit()
   started = 1
   rows = 0
@@ -302,9 +330,12 @@ length($0) > MAX_LINE { next }
   if (up < 0 || down < 0) next
 
   key = F[1]
+  # Membership before the reads below: merely naming lastUp[key] in an
+  # expression creates the element, so testing afterwards is always false and
+  # the key ceiling would never stand the accumulator down.
+  if (!(key in lastUp)) nKeys++
   du = up - lastUp[key];   if (du < 0) du = up
   dd = down - lastDown[key]; if (dd < 0) dd = down
-  if (!(key in lastUp)) nKeys++
   lastUp[key] = up; lastDown[key] = down
 
   a = (pid + 0 == 0) ? unknownBucket(name) : appname(name, pid)
@@ -327,6 +358,7 @@ run_accumulator() {
   local iface=$1 interval=$2 probe_every=$3
   "$NETHOGS" -t -C -v 2 -d "$interval" "${NH_FILTER[@]}" "$iface" 2>/dev/null |
     awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
+        -v PROCDEV="${NET_USAGE_PROC_DEV:-/proc/net/dev}" \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
         -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
         -- "$ACCUMULATE"
@@ -384,6 +416,140 @@ top() {
       printf '%-24.24s %12s %12s  %s\n' \
         "$name" "$(human "$down")" "$(human "$up")" "$kind"
     done
+}
+
+# Kernel counters for one interface out of a /proc/net/dev snapshot: "rx tx",
+# or "0 0" when the interface is absent or the file unreadable.
+proc_dev_counters() {
+  awk -v want="$2" '
+    {
+      line = $0; sub(/^[ \t]+/, "", line)
+      if (index(line, want ":") == 1) {
+        rest = substr(line, length(want) + 2)
+        n = split(rest, f, /[ \t]+/); j = 0
+        for (i = 1; i <= n; i++) if (f[i] != "") v[++j] = f[i]
+        if (j >= 9) { printf "%.0f %.0f", v[1] + 0, v[9] + 0; found = 1 }
+      }
+    }
+    END { if (!found) printf "0 0" }' "$1" 2>/dev/null || printf '0 0'
+}
+
+# First non-loopback interface named in a /proc/net/dev snapshot. Fixture-mode
+# fallback only, so a hand-made fixture needs no live route and no iface file.
+iface_from_proc() {
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    index(line, ":") > 0 {
+      name = substr(line, 1, index(line, ":") - 1)
+      if (name != "" && name != "lo" && name !~ /^Inter/) { print name; exit }
+    }' "$1" 2>/dev/null
+}
+
+# The cross-check. Runs the same accumulator as top() over the same capture,
+# then reads the kernel's own byte counters for the monitored interface before
+# and after and asks whether the two agree. They should: nethogs watches the
+# same wire the kernel counts, plus a few percent of headers. A counted total
+# several times the wire means the attribution is wrong, not the traffic — the
+# usual suspect is a churn of short-lived processes landing in the unknown
+# bucket with deltas miscounted across accumulator restarts. Reads only;
+# history.json is never touched.
+#
+# Fixture mode: with NET_USAGE_FIXTURE_DIR set, the capture comes from
+# $dir/stream.txt and the kernel counters from $dir/proc_before and
+# $dir/proc_after (full /proc/net/dev text, plus an optional $dir/iface
+# naming the interface), so the verdict is deterministic.
+validate() {
+  local secs=${1:-5} iface fixdir="${NET_USAGE_FIXTURE_DIR:-}"
+  local kbefore kafter rows helper
+  local brx btx arx atx kup kdown cup cdown ctot ktot ratio
+
+  if [ -n "$fixdir" ]; then
+    [ -f "$fixdir/stream.txt" ] || die "fixture $fixdir/stream.txt is missing"
+    [ -f "$fixdir/proc_before" ] || die "fixture $fixdir/proc_before is missing"
+    [ -f "$fixdir/proc_after" ] || die "fixture $fixdir/proc_after is missing"
+    if [ -f "$fixdir/iface" ]; then
+      iface=$(head -n 1 "$fixdir/iface")
+    elif [ -n "${NET_USAGE_IFACE:-}" ]; then
+      iface=$NET_USAGE_IFACE
+    else
+      iface=$(default_iface) || true
+      [ -n "$iface" ] || iface=$(iface_from_proc "$fixdir/proc_before")
+    fi
+    [ -n "$iface" ] || die "no interface: put one in $fixdir/iface"
+    # No live helpers in fixture mode: the probe would answer with today's
+    # date and the live route, and per-snapshot kernel reads have no fixture
+    # counterpart (downstream only keeps the row lines anyway).
+    helper=true
+  else
+    [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
+    iface=$(default_iface) || true
+    [ -n "$iface" ] || die "no default route: nothing to watch"
+    helper=$SELF
+  fi
+
+  printf 'Validating %s for %ss (counted vs kernel)...\n\n' "$iface" "$secs"
+
+  if [ -n "$fixdir" ]; then
+    kbefore=$(proc_dev_counters "$fixdir/proc_before" "$iface")
+    rows=$(awk -v HELPER="$helper" -v IFACE="$iface" -v PROBE_EVERY=3 \
+        -v PROCDEV=/dev/null \
+        -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
+        -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
+        -- "$ACCUMULATE" < "$fixdir/stream.txt" |
+      awk '/^snap/ { buf = "" } /^row/ { buf = buf $0 "\n" } END { printf "%s", buf }')
+    kafter=$(proc_dev_counters "$fixdir/proc_after" "$iface")
+  else
+    kbefore=$(proc_dev_counters /proc/net/dev "$iface")
+    rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" "$iface" 2>/dev/null |
+      awk -v HELPER="$helper" -v IFACE="$iface" -v PROBE_EVERY=3 \
+          -v PROCDEV="${NET_USAGE_PROC_DEV:-/proc/net/dev}" \
+          -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
+          -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
+          -- "$ACCUMULATE" |
+      awk '/^snap/ { buf = "" } /^row/ { buf = buf $0 "\n" } END { printf "%s", buf }')
+    kafter=$(proc_dev_counters /proc/net/dev "$iface")
+  fi
+
+  if [ -n "$rows" ]; then
+    printf '%-24s %12s %12s  %s\n' "APP" "DOWN" "UP" "SOURCE"
+    printf '%s\n' "$rows" |
+      sort -t"$(printf '\t')" -k3,3nr |
+      while IFS="$(printf '\t')" read -r _ up down kind name; do
+        printf '%-24.24s %12s %12s  %s\n' \
+          "$name" "$(human "$down")" "$(human "$up")" "$kind"
+      done
+  else
+    printf 'Nothing moved.\n'
+  fi
+  printf '\n'
+
+  read -r brx btx <<<"$kbefore"
+  read -r arx atx <<<"$kafter"
+  kdown=$((arx - brx)); kup=$((atx - btx))
+  # A counter that went backwards wrapped or reset; take the later reading.
+  if [ "$kdown" -lt 0 ]; then kdown=$arx; fi
+  if [ "$kup" -lt 0 ]; then kup=$atx; fi
+  cup=$(printf '%s\n' "$rows" | awk -F'\t' '{ u += $2 } END { printf "%.0f", u + 0 }')
+  cdown=$(printf '%s\n' "$rows" | awk -F'\t' '{ d += $3 } END { printf "%.0f", d + 0 }')
+  ctot=$((cup + cdown)); ktot=$((kdown + kup))
+
+  printf 'KERNEL %s down %s up %s\n' "$iface" "$(human "$kdown")" "$(human "$kup")"
+  if [ "$ktot" -le 0 ]; then
+    printf 'RATIO n/a (no wire traffic in the window)\n'
+    printf 'VERDICT INSUFFICIENT-DATA — rerun while traffic flows.\n'
+    return 0
+  fi
+  ratio=$(awk -v c="$ctot" -v k="$ktot" 'BEGIN { printf "%.2f", c / k }')
+  printf 'RATIO %s (counted %s / kernel %s)\n' \
+    "$ratio" "$(human "$ctot")" "$(human "$ktot")"
+  if awk -v r="$ratio" 'BEGIN { exit !(r <= 1.5) }'; then
+    printf 'VERDICT OK — counted bytes track the wire.\n'
+  elif awk -v r="$ratio" 'BEGIN { exit !(r <= 2.5) }'; then
+    printf 'VERDICT SUSPECT — counted %sx the wire; watch the unknown bucket.\n' "$ratio"
+  else
+    printf 'VERDICT OVERSHOOT — counted %sx the wire. Likely unknown-bucket churn: a storm of short-lived build workers (e.g. npm run build) landing in (unknown TCP) with deltas miscounted across accumulator restarts. Grep `note\trestart` in `net-usage stream` output for the restarts.\n' "$ratio"
+  fi
+  return 0
 }
 
 # The chart can say how many bytes it failed to trace to an app. It cannot say
@@ -598,6 +764,7 @@ PERL
 case "${1:-top}" in
   stream)  shift; stream "$@" ;;
   top)     shift; top "$@" ;;
+  validate) shift; validate "$@" ;;
   explain) shift; explain "$@" ;;
   history) history_read ;;
   save)    history_write ;;
@@ -607,5 +774,5 @@ case "${1:-top}" in
   -h|--help)
     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "unknown command '${1}' — try: top, stream, explain, history, probe, doctor" ;;
+  *) die "unknown command '${1}' — try: top, stream, validate, explain, history, probe, doctor" ;;
 esac
