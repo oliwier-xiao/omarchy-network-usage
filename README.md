@@ -2,6 +2,10 @@
 
 Which apps used your bandwidth, one click from your Omarchy bar.
 
+| Install | Update | Remove |
+|---|---|---|
+| `omarchy plugin add https://github.com/oliwier-xiao/omarchy-network-usage.git --enable` | `omarchy plugin update oliwier.network-usage` | `omarchy plugin remove oliwier.network-usage` |
+
 ![The Network Usage panel: today's download and upload, ranked by app](preview.png)
 
 Two ranked bar charts — one for what came down, one for what went up — and a day of history
@@ -27,9 +31,6 @@ the plugin has nothing to count without it — the kernel does not keep that sco
 omarchy pkg add nethogs
 ```
 
-No sudo or pkexec is needed afterwards: the package grants its own binary the capabilities it
-needs at install time, and the plugin never asks for more.
-
 **2. Add the plugin.**
 
 ```bash
@@ -47,6 +48,9 @@ The panel will tell you if `nethogs` is not there yet. To ask directly:
 ```bash
 ~/.config/omarchy/plugins/oliwier.network-usage/bin/net-usage doctor
 ```
+
+Update anytime with `omarchy plugin update oliwier.network-usage`. To take it off the bar,
+see [Removing it](#removing-it) — the history stays behind unless you clear it too.
 
 ---
 
