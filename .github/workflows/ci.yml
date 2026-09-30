@@ -54,6 +54,10 @@ jobs:
         run: |
           jq -e '(.kinds | index("service") | not) or (.entryPoints | has("service"))' manifest.json > /dev/null
           jq -e '(.kinds | index("bar-widget") | not) or (.entryPoints | has("barWidget"))' manifest.json > /dev/null
+      - name: Every setting in the schema has a matching default
+        run: |
+          jq -e '.barWidget as $w | [$w.schema[] | select($w.defaults[.key] != .defaultValue)] | length == 0' manifest.json > /dev/null \
+            || { jq -r '.barWidget as $w | $w.schema[] | select($w.defaults[.key] != .defaultValue) | "default differs from schema: " + .key' manifest.json; exit 1; }
       - name: No symlinks anywhere
         run: |
           found=$(find . -path ./.git -prune -o -type l -print)
