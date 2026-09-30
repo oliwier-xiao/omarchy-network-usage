@@ -35,6 +35,7 @@
       "topApps": 8,
       "nameContainers": true,
       "showUnattributed": true,
+      "countLanNoise": false,
       "keepDays": 90,
       "interface": ""
     },
