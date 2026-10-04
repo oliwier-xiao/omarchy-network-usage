@@ -31,6 +31,10 @@ the plugin has nothing to count without it — the kernel does not keep that sco
 omarchy pkg add nethogs
 ```
 
+Everything else it calls is already part of every Omarchy install: `perl` (the history file is
+read and written through it), `ip` from iproute2, `awk` (gawk; mawk works too), and `timeout` and
+`setsid` from coreutils and util-linux. `docker` is optional and only names container traffic.
+
 **2. Add the plugin.**
 
 ```bash
@@ -59,6 +63,10 @@ see [Removing it](#removing-it) — the history stays behind unless you clear it
 **Wire bytes**, headers included, which run about 3% above the payload an app thinks it moved.
 That is the honest figure — it is what your connection actually carried and what a data cap
 counts.
+
+Shown in 1024s: a KB here is 1024 bytes, an MB 1024 KB, the way most desktop tools count. A
+provider usually counts in 1000s, so the same traffic reads higher on its bill: a 100 GB cap is
+about 93.1 GB here.
 
 Totals are counted continuously between samples, not sampled from them, so a shorter sample
 interval does not make them more accurate. It only makes the panel newer.
@@ -219,8 +227,16 @@ find out what an unnamed bar was made of. `net-usage doctor` reports what is mis
 - **A recycled process id** is attributed to whatever held that id before it, until the daily
   restart clears the slate. There is no way to see this from outside the tool.
 - **A tunnel counts once.** With WireGuard or a VPN up, the same payload is visible as plaintext
-  inside the tunnel and as encrypted UDP outside it. The plugin follows the default route and
-  counts one of them; name the other under **Watch this interface** if it is the one you meant.
+  inside the tunnel and as encrypted UDP outside it. The plugin follows the default route (IPv4,
+  or IPv6 where that is the only one) and counts one of them; name the other under **Watch this
+  interface** if it is the one you meant. A tunnel carries no broadcast chatter, so on one the
+  capture filter for it is left off.
+- **A name is what a program calls itself.** nethogs reports each process by its own command
+  line, which any program on the machine, under any account, can set. A row can carry a made-up
+  name and plausible numbers. What one program can do is bounded — names are plain text, a total
+  must be a plain decimal under a petabyte, and a line that only looks like the start of a new
+  snapshot is ignored — but the kernel's own counters, shown as the wire total and checked by
+  `net-usage validate`, are the totals to trust.
 - **Traffic before the shell started** was not counted. This is a ledger kept from when it was
   opened, not a reconstruction.
 
@@ -252,14 +268,27 @@ again, rather than the day being lost to a parse error.
 
 The shell never opens it. `omarchy-shell` is one process for every plugin on the desktop, so the
 file is opened once in a child process, with the flags that refuse a symlink outright and decline
-to wait on a pipe, and its type, its owner and its length are then read off that one descriptor
-rather than off the name — which anything else running as you can change between one look and the
-next. Something too large is refused whole rather than cut down to the ceiling: half a document is
-not a shorter history, it is a parse error wearing one.
+to wait on a pipe, and its type, its owner, its link count, its mode and its length are then read
+off that one descriptor rather than off the name — which anything else running as you can change
+between one look and the next. A file with a second name, one that anybody else may write, or one
+in a folder reached through a link is refused like one that is too large. Something too large is
+refused whole rather than cut down to the ceiling: half a document is not a shorter history, it is
+a parse error wearing one.
 
-Nor is it written by the shell. The replacement is built beside it under a name that the open
-either creates or fails on, and then renamed over the old one — so a link left at `history.json`
-is what gets replaced, and whatever it pointed at is never opened.
+If the reader itself fails — it was killed, or ran out of time — that says nothing about the file,
+so nothing is written over it: the panel asks again, and if it still cannot read the history it
+counts today and keeps it in memory until the shell restarts.
+
+Nor is it written by the shell. The replacement is built beside it under a random name that the
+open either creates or fails on, synced, and then renamed over the old one — so a link left at
+`history.json` is what gets replaced, and whatever it pointed at is never opened. A writer that is
+stopped part way removes its temporary file, and one left by a writer that was killed outright is
+swept up an hour later.
+
+Every program the plugin starts gets a cleared environment with a fixed `PATH`, the C locale,
+`HOME`, and `TZ` and the `DOCKER_` settings when you have them. Any account on the machine can
+read a command line, so the ones it starts carry only the interface name, the plugin's own path,
+container ids and fixed options — never a container's name or anything from the history.
 
 ## License
 

@@ -181,7 +181,8 @@ test("both unknown buckets hide together", () => {
 test("dayFor falls back to an empty day rather than undefined", () => {
   const empty = Model.dayFor({}, null, "2026-01-01", "2026-08-26")
   assert.equal(empty.down, 0)
-  assert.deepEqual(empty.apps, {})
+  assert.deepEqual(Object.keys(empty.apps), [])
+  assert.equal(Object.getPrototypeOf(empty.apps), null)
 })
 
 // ---------------------------------------------------------------- hardening
@@ -260,4 +261,29 @@ test("sanitizeStore clips a name long enough to be a payload", () => {
   const name = Object.keys(store["2026-08-27"].apps)[0]
   assert.equal(name.length, 128)
   assert.equal(store["2026-08-27"].apps[name].kind.length, 32)
+})
+
+// ---------------------------------------------------------------- 1.2.1 review
+
+test("formatBytes says 1 MB rather than 1024 KB", () => {
+  assert.equal(Model.formatBytes(1048575), "1 MB")
+  assert.equal(Model.formatBytes(1048576), "1 MB")
+  assert.equal(Model.formatBytes(1023), "1023 B")
+  assert.equal(Model.formatBytes(1024 * 1024 * 1024 - 1), "1 GB")
+  assert.equal(Model.formatBytes(1536), "1.5 KB")
+})
+
+// A process may call itself anything, and these names are already keys of every
+// plain object. As app-table keys they found inherited values where totals
+// should be; "__proto__" from a parsed history replaced the table's prototype.
+test("app tables take any name, including the ones a plain object already has", () => {
+  const names = ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]
+  const parsed = JSON.parse('{"2026-10-04": {"up": 5, "down": 5, "apps": {' +
+    names.map(n => JSON.stringify(n) + ': {"up": 1, "down": 1, "kind": "proc"}').join(", ") + "}}}")
+  const store = Model.sanitizeStore(parsed, 400, 100)
+  const apps = store["2026-10-04"].apps
+  assert.deepEqual(Object.keys(apps).sort(), names.slice().sort())
+  for (const n of names) assert.equal(apps[n].up, 1, n)
+  assert.equal(Object.getPrototypeOf(apps), null)
+  assert.equal(Object.getPrototypeOf(Model.emptyDay().apps), null)
 })

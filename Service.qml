@@ -33,8 +33,13 @@ Item {
   property bool countLanNoise: false
   property string interfaceName: ""
 
-  readonly property string home: Quickshell.env("HOME")
-  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string home: String(Quickshell.env("HOME") || "")
+  // Qt.resolvedUrl percent-encodes, so a home folder with a space in it reached
+  // every Process below as a literal %20, and none of them started.
+  readonly property string pluginDir: {
+    var s = String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
+    try { return decodeURIComponent(s) } catch (e) { return s }
+  }
   readonly property string dataDir: home + "/.local/state/omarchy/network-usage"
   readonly property string historyPath: dataDir + "/history.json"
 
@@ -57,9 +62,36 @@ Item {
 
   // Running totals from the current stream, so a restart of the collector is
   // not mistaken for traffic. Cleared whenever the stream stands down.
-  property var lastSeen: ({})
-  property var lastKernel: ({})
+  //
+  // Keyed by names other programs choose, so these maps, and every app table
+  // below, have no prototype: in a plain object a process called `constructor`
+  // or `toString` found an inherited function where its last total should be,
+  // the delta came out NaN, and the whole day's total was lost with it.
+  property var lastSeen: Object.create(null)
+  property var lastKernel: Object.create(null)
   property string lastRestartReason: ""
+  // What `doctor` found missing, kept so the collector's own, vaguer reason
+  // ("nethogs stopped right after starting") does not replace it.
+  property string doctorReason: ""
+
+  // Every process here starts from a cleared environment with these put back.
+  // Inherited whole, the session's environment reached nethogs, which holds
+  // capture capabilities, and perl and docker after it: BASH_ENV, PERL5OPT,
+  // whatever tokens somebody exported. PATH is fixed and LC_ALL is C, for the
+  // reason bin/net-usage gives. TZ goes through because the collector's day has
+  // to be the day this file's own clock says, and the DOCKER_ ones because
+  // rootless and remote docker are found through them.
+  function childEnv(extra) {
+    var env = { "PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C" }
+    if (root.home !== "") env["HOME"] = root.home
+    var pass = ["TZ", "XDG_RUNTIME_DIR", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"]
+    for (var i = 0; i < pass.length; i++) {
+      var v = String(Quickshell.env(pass[i]) || "")
+      if (v !== "") env[pass[i]] = v
+    }
+    if (extra) for (var k in extra) env[k] = extra[k]
+    return env
+  }
 
   // ------------------------------------------------------------- accumulate
 
@@ -85,7 +117,11 @@ Item {
   // whether anything actually moved, so a quiet snapshot publishes nothing.
   function noteRow(row, day) {
     if (!row) return false
-    var prev = root.lastSeen[row.name]
+    // By kind as well as name. A container called nginx and a process called
+    // nginx are two running totals; under one key each looked like the other's
+    // restart, and both were counted again from zero, five times over in a test.
+    var seenKey = row.kind + "\t" + row.name
+    var prev = root.lastSeen[seenKey]
     var dUp, dDown
     if (prev === undefined) {
       // First sight in this stream: the running total IS the delta.
@@ -98,7 +134,7 @@ Item {
       if (dUp < 0) dUp = row.up
       if (dDown < 0) dDown = row.down
     }
-    root.lastSeen[row.name] = { up: row.up, down: row.down }
+    root.lastSeen[seenKey] = { up: row.up, down: row.down }
     if (dUp <= 0 && dDown <= 0) return false
 
     // A fresh app record too: the table was shallow-copied from the previous
@@ -131,6 +167,8 @@ Item {
   property var pendingRows: []
   property var pendingKers: []
   property bool fenceNextEnd: false
+  // Set by a snapshot from a day this file's clock has already left behind.
+  property bool dropSnapshot: false
 
   function rollTo(key) {
     if (!key || key === root.todayKey) return
@@ -138,8 +176,8 @@ Item {
     if (!root.days[key]) root.replaceDay(key, Model.emptyDay())
     // A new day is a new counting origin; the collector restarts too, but say
     // so here as well so a clock jump cannot fold yesterday into today.
-    root.lastSeen = ({})
-    root.lastKernel = ({})
+    root.lastSeen = Object.create(null)
+    root.lastKernel = Object.create(null)
   }
 
   function commitSnapshot() {
@@ -157,7 +195,7 @@ Item {
     var day = {
       up: Number(prevDay.up) || 0,
       down: Number(prevDay.down) || 0,
-      apps: {}
+      apps: Object.create(null)
     }
     if (prevDay.kUp !== undefined) day.kUp = Number(prevDay.kUp) || 0
     if (prevDay.kDown !== undefined) day.kDown = Number(prevDay.kDown) || 0
@@ -178,8 +216,8 @@ Item {
 
   function restartStream() {
     streamProc.running = false
-    root.lastSeen = ({})
-    root.lastKernel = ({})
+    root.lastSeen = Object.create(null)
+    root.lastKernel = Object.create(null)
     startTimer.restart()
   }
 
@@ -197,12 +235,10 @@ Item {
   Process {
     id: streamProc
     running: false
-    command: {
-      var c = [root.pluginDir + "/bin/net-usage", "stream", String(root.sampleSeconds)]
-      return c
-    }
-    environment: ({
-      "HOME": root.home,
+    command: [root.pluginDir + "/bin/net-usage", "stream",
+              String(Math.min(10, Math.max(1, Math.round(Number(root.sampleSeconds) || 2))))]
+    clearEnvironment: true
+    environment: root.childEnv({
       "NET_USAGE_IFACE": root.interfaceName,
       "NET_USAGE_CONTAINERS": root.nameContainers ? "1" : "0",
       "NET_USAGE_LAN_NOISE": root.countLanNoise ? "1" : "0"
@@ -215,26 +251,41 @@ Item {
         // is cheaper than discovering why it was.
         if (s.length > 4096) return
 
+        // `ready` names the interface and nothing more. Counting is shown as
+        // working once the first snapshot arrives: a nethogs that could not
+        // open its capture was started, said ready and died every two seconds,
+        // and each `ready` put back a panel that claimed to be counting.
         if (s.indexOf("ready\t") === 0) {
           var f = s.split("\t")
           root.watching = f.length > 1 ? f[1] : ""
-          root.available = true
-          root.unavailableReason = ""
           return
         }
         if (s.indexOf("wait\t") === 0) {
           root.available = false
-          root.unavailableReason = s.split("\t")[1] || "waiting"
+          root.unavailableReason = root.doctorReason || s.split("\t")[1] || "waiting"
           return
         }
         if (s.indexOf("snap\t") === 0) {
           var day = s.split("\t")[1] || ""
-          if (day) root.rollTo(day)
+          root.available = true
+          root.unavailableReason = ""
           root.pendingRows = []
           root.pendingKers = []
+          // A collector that has not noticed midnight yet still says
+          // yesterday, and this file's own clock got there first. Rolling back
+          // cleared the running totals, and the snapshot's whole total was then
+          // counted into yesterday a second time. Such a snapshot is dropped.
+          root.dropSnapshot = (day !== "" && root.todayKey !== "" && day < root.todayKey)
+          if (day && !root.dropSnapshot) root.rollTo(day)
           return
         }
         if (s === "end") {
+          if (root.dropSnapshot) {
+            root.dropSnapshot = false
+            root.pendingRows = []
+            root.pendingKers = []
+            return
+          }
           if (root.fenceNextEnd) {
             // The collector emits a final snapshot from its END block after a restart note.
             // Committing it after a day-roll would double-count the old lifecycle's totals
@@ -250,6 +301,9 @@ Item {
         }
         if (s.indexOf("note\trestart\t") === 0) {
           root.fenceNextEnd = true
+          // The next collector counts from zero. An app whose new total
+          // overtook its old one before this cleared lost the old one.
+          root.lastSeen = Object.create(null)
           var reason = s.split("\t")[2] || ""
           root.lastRestartReason = reason
           var key = root.todayKey
@@ -258,7 +312,7 @@ Item {
             var newDay = {
               up: Number(prevDay.up) || 0,
               down: Number(prevDay.down) || 0,
-              apps: {}
+              apps: Object.create(null)
             }
             if (prevDay.kUp !== undefined) newDay.kUp = Number(prevDay.kUp) || 0
             if (prevDay.kDown !== undefined) newDay.kDown = Number(prevDay.kDown) || 0
@@ -304,8 +358,9 @@ Item {
   Process {
     id: doctorProc
     running: false
-    command: [root.pluginDir + "/bin/net-usage", "doctor"]
-    environment: ({ "HOME": root.home })
+    command: ["/usr/bin/timeout", "-k", "2", "20", root.pluginDir + "/bin/net-usage", "doctor"]
+    clearEnvironment: true
+    environment: root.childEnv()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -313,13 +368,15 @@ Item {
         for (var i = 0; i < lines.length; i++) {
           var f = lines[i].split("\t")
           if (f[0] === "nethogs" && f[1] === "missing") {
+            root.doctorReason = "nethogs is not installed"
             root.available = false
-            root.unavailableReason = "nethogs is not installed"
+            root.unavailableReason = root.doctorReason
             return
           }
           if (f[0] === "caps" && f[1] === "missing") {
+            root.doctorReason = "nethogs cannot open a capture socket"
             root.available = false
-            root.unavailableReason = "nethogs cannot open a capture socket"
+            root.unavailableReason = root.doctorReason
             return
           }
         }
@@ -340,7 +397,7 @@ Item {
   }
 
   function save() {
-    if (!root.ready) return
+    if (!root.ready || root.saveBlocked) return
     // One writer at a time. Skipping leaves pendingWrite standing, so the next
     // tick of the timer picks it up rather than the sample being dropped.
     if (historyWrite.running) return
@@ -382,8 +439,12 @@ Item {
     id: historyWrite
     running: false
     stdinEnabled: true
-    command: [root.pluginDir + "/bin/net-usage", "save"]
-    environment: ({ "HOME": root.home })
+    // With a deadline of its own. A writer that never came back held
+    // `historyWrite.running` true for good, and save() returns early on that,
+    // so nothing was saved again until the shell restarted.
+    command: ["/usr/bin/timeout", "-k", "2", "20", root.pluginDir + "/bin/net-usage", "save"]
+    clearEnvironment: true
+    environment: root.childEnv()
     onStarted: {
       historyWrite.write(root.pendingDoc)
       // Closing the pipe is what tells the child the store is complete; without
@@ -392,26 +453,83 @@ Item {
     }
   }
 
-  Process {
-    id: historyProc
-    running: false
-    command: ["timeout", "5", root.pluginDir + "/bin/net-usage", "history"]
-    environment: ({ "HOME": root.home })
+  // Reading the history, which has to end in one of three ways: the file, a
+  // first run with none, or a file kept aside. The text and the exit status
+  // arrive in no fixed order, so the verdict waits for both.
+  property string historyText: ""
+  property bool historyStreamDone: false
+  property int historyCode: -1
+  property int historyTries: 0
+  // Set when the history could not be read for a reason that says nothing about
+  // the file: the reader was killed or timed out. Nothing is written then, so a
+  // history that is there is not replaced by the empty day this starts on.
+  property bool saveBlocked: false
 
-    stdout: StdioCollector {
-      onStreamFinished: root.onHistoryText(this.text)
-    }
+  function loadHistory() {
+    root.historyText = ""
+    root.historyStreamDone = false
+    root.historyCode = -1
+    historyDeadline.restart()
+    historyProc.running = true
+  }
+
+  function settleHistory() {
+    if (root.ready || root.historyCode === -1 || !root.historyStreamDone) return
+    historyDeadline.stop()
+    var code = root.historyCode
+    if (code === 0) { root.onHistoryText(root.historyText); return }
     // 3 is the reader saying there is something at that path that it will not
     // read: too large, not a regular file, not ours. It printed nothing — and so
     // does an ordinary first run, so without this the next save would quietly
     // write over whatever was there. Keep it aside instead, as with one that
     // will not parse.
-    //
-    // And if it produced no stream at all — missing, killed — the plugin still
-    // has to start, on an empty day rather than not at all.
+    if (code === 3) { keepBrokenProc.running = true; root.onHistoryText(""); return }
+    root.historyFailed()
+  }
+
+  // Killed, timed out, out of memory, not started at all: nothing is known
+  // about the file. Through 1.2.0 this started on an empty store as though
+  // there were no history, and the first save, twenty seconds later, replaced
+  // the real one with it. Asked again, and if it still cannot be read the
+  // plugin counts today and writes nothing.
+  function historyFailed() {
+    if (root.ready) return
+    if (root.historyTries < 3) {
+      root.historyTries++
+      historyRetry.restart()
+      return
+    }
+    root.saveBlocked = true
+    console.warn("oliwier.network-usage: the history could not be read, so nothing will be written over it until the shell restarts")
+    root.onHistoryText("")
+  }
+
+  Timer { id: historyRetry; interval: 5000; onTriggered: root.loadHistory() }
+
+  // A Process that fails to start emits neither a stream nor an exit status.
+  Timer {
+    id: historyDeadline
+    interval: 15000
+    onTriggered: { historyProc.running = false; root.historyFailed() }
+  }
+
+  Process {
+    id: historyProc
+    running: false
+    command: ["/usr/bin/timeout", "-k", "1", "5", root.pluginDir + "/bin/net-usage", "history"]
+    clearEnvironment: true
+    environment: root.childEnv()
+
+    stdout: StdioCollector {
+      onStreamFinished: {
+        root.historyText = this.text
+        root.historyStreamDone = true
+        Qt.callLater(root.settleHistory)
+      }
+    }
     onExited: function (code) {
-      if (code === 3) keepBrokenProc.running = true
-      if (!root.ready) root.onHistoryText("")
+      root.historyCode = code
+      Qt.callLater(root.settleHistory)
     }
   }
 
@@ -443,7 +561,7 @@ Item {
       var day = store[k]
       if (!day || !day.apps || !day.apps[LEGACY]) { out[k] = day; continue }
       var row = day.apps[LEGACY]
-      var apps = {}
+      var apps = Object.create(null)
       for (var n in day.apps) if (n !== LEGACY) apps[n] = day.apps[n]
       var newDay = {
         up: Math.max(0, (day.up || 0) - (row.up || 0)),
@@ -498,10 +616,11 @@ Item {
   Process {
     id: keepBrokenProc
     running: false
-    command: ["sh", "-c",
+    command: ["/usr/bin/timeout", "-k", "2", "10", "/usr/bin/sh", "-c",
       "f=\"$1\"; [ -s \"$f\" ] && [ ! -e \"$f.broken\" ] && mv -- \"$f\" \"$f.broken\"; exit 0",
       "sh", root.historyPath]
-    environment: ({ "HOME": root.home })
+    clearEnvironment: true
+    environment: root.childEnv()
   }
 
   Process {
@@ -511,12 +630,13 @@ Item {
     // that already exists keeps whatever it had — including a mode an older
     // version, a restored backup or a stray umask left readable to everyone.
     // Creating it and securing it are two statements, not one.
-    command: ["sh", "-c",
+    command: ["/usr/bin/timeout", "-k", "2", "10", "/usr/bin/sh", "-c",
       "d=\"$1\"; mkdir -p -m 700 -- \"$d\" 2>/dev/null || exit 0; " +
       "[ -L \"$d\" ] || chmod 700 -- \"$d\" 2>/dev/null; exit 0",
       "sh", root.dataDir]
-    environment: ({ "HOME": root.home })
-    onExited: historyProc.running = true
+    clearEnvironment: true
+    environment: root.childEnv()
+    onExited: root.loadHistory()
   }
 
   // Midnight, a resume from suspend, or a clock jump all land here.
