@@ -2,9 +2,23 @@
 
 Which apps used your bandwidth, one click from your Omarchy bar.
 
-| Install | Update | Remove |
-|---|---|---|
-| `omarchy plugin add https://github.com/oliwier-xiao/omarchy-network-usage.git --enable` | `omarchy plugin update oliwier.network-usage` | `omarchy plugin remove oliwier.network-usage` |
+**Install**
+
+```bash
+omarchy plugin add https://github.com/oliwier-xiao/omarchy-network-usage.git --enable
+```
+
+**Update**
+
+```bash
+omarchy plugin update oliwier.network-usage
+```
+
+**Remove**
+
+```bash
+omarchy plugin remove oliwier.network-usage
+```
 
 ![The Network Usage panel: today's download and upload, ranked by app](preview.png)
 
