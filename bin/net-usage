@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # net-usage — which apps used the network, in bytes.
 #
 # Wraps nethogs, which is the only tool on a stock Arch box that attributes
@@ -21,7 +21,13 @@
 
 set -uo pipefail
 
-VERSION=1.2.0
+# Every number below is read and printed in the C locale, whatever the session
+# uses. nethogs prints 5.12971e+06 under every locale, and mawk under a
+# comma-decimal one (pl_PL, de_DE) reads that as 5: the same capture came to
+# 7.7 GB under C and to 905 KB under pl_PL, with a verdict of OK.
+export LC_ALL=C
+
+VERSION=1.2.1
 NETHOGS=/usr/bin/nethogs
 
 # The uplink also carries the whole subnet's broadcast and multicast chatter —
@@ -33,8 +39,36 @@ NETHOGS=/usr/bin/nethogs
 # enormous unnamed bar that answers nothing and alarms everyone who sees it.
 # Drop it at the capture, where it costs nothing. Setting NET_USAGE_LAN_NOISE=1
 # counts it again, for whoever is measuring the wire rather than the machine.
-NH_FILTER=(-f 'not (ether multicast or ether broadcast)')
-if [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ]; then NH_FILTER=(); fi
+#
+# Only on an Ethernet-framed link (type 1). pcap refuses an `ether` filter on any
+# other kind -- a WireGuard or other tun device, PPP -- and nethogs exits on the
+# refusal, so with a full-tunnel VPN as the default route, or with the tunnel
+# named in the interface setting as this README advises, nothing was counted at
+# all. Those links carry no broadcast chatter of this kind to drop.
+NH_FILTER=()
+set_filter() {
+  NH_FILTER=()
+  [ "${NET_USAGE_LAN_NOISE:-0}" = "1" ] && return 0
+  [ "$(cat "/sys/class/net/$1/type" 2>/dev/null)" = "1" ] &&
+    NH_FILTER=(-f 'not (ether multicast or ether broadcast)')
+  return 0
+}
+
+# mawk reads a pipe in 4 KiB blocks unless told otherwise, so on a quiet machine
+# a snapshot sat in its buffer for minutes: 95 seconds of `stream 2` produced
+# nothing past the first line. gawk reads what is there, and does not know the
+# option, so it is asked for only where the awk is mawk.
+AWK_FLAGS=()
+awk_flags() {
+  AWK_FLAGS=()
+  case "$(awk -W version 2>&1)" in mawk*) AWK_FLAGS=(-W interactive) ;; esac
+}
+
+# A number given on the command line, checked before it reaches arithmetic or
+# another program: a whole number from $2 to $3.
+whole() {
+  [[ $1 =~ ^[0-9]{1,6}$ ]] && [ "$((10#$1))" -ge "$2" ] && [ "$((10#$1))" -le "$3" ]
+}
 
 # The shell this plugin runs inside is shared with the whole desktop, and
 # Quickshell's FileView will hand it whatever is at a path with no ceiling on
@@ -82,9 +116,17 @@ default_iface() {
   if [ -n "${NET_USAGE_IFACE:-}" ]; then
     printf '%s\n' "$NET_USAGE_IFACE"; return 0
   fi
-  ip route show default 2>/dev/null | awk '/^default/ {
+  # IPv4 first, then IPv6: a network with only an IPv6 default route used to read
+  # as no route at all.
+  local dev
+  dev=$(ip route show default 2>/dev/null | awk '/^default/ {
     for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }
-  }'
+  }')
+  [ -n "$dev" ] || dev=$(ip -6 route show default 2>/dev/null | awk '/^default/ {
+    for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }
+  }')
+  [ -n "$dev" ] && printf '%s\n' "$dev"
+  return 0
 }
 
 # Container traffic never carries a host pid — the socket lives in another
@@ -96,25 +138,32 @@ containers() {
   [ "${NET_USAGE_CONTAINERS:-1}" = "1" ] || return 0
   command -v docker >/dev/null 2>&1 || return 0
 
-  local ids
-  ids=$(timeout 2 docker ps -q 2>/dev/null) || return 0
+  local ids name pid mode rx tx
+  ids=$(timeout -k 1 2 docker ps -q 2>/dev/null | head -c 65536) || return 0
   [ -n "$ids" ] || return 0
 
   # One call for every container. A wedged daemon costs one lookup and a
   # skipped refresh, never a hung widget.
-  timeout 2 docker inspect --format '{{.Name}}|{{.State.Pid}}' $ids 2>/dev/null |
-  while IFS='|' read -r name pid; do
-    name=${name#/}
-    [ -n "$name" ] && [ -n "$pid" ] && [ "$pid" != "0" ] || continue
+  #
+  # A container that shares a network namespace it does not own -- the host's
+  # (--network host) or another container's -- reports those counters, not its
+  # own: the host's are already the process rows, and the other container's are
+  # its own row. Counting them again put a second copy of the whole machine's
+  # traffic on top of the first. Only a namespace of its own is a container's.
+  #
+  # The name is read and printed here and goes on no command line: the awk below
+  # is handed only the pid's own file.
+  # shellcheck disable=SC2086 # the ids are words, one per container
+  timeout -k 1 2 docker inspect --format '{{.Name}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}' $ids 2>/dev/null |
+  head -c 1048576 |
+  while IFS='|' read -r name pid mode; do
+    name=${name#/}; name=${name//[$'\t\n\r']/ }
+    [ -n "$name" ] && [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || continue
+    case $mode in host|none|container:*) continue ;; esac
     [ -r "/proc/$pid/net/dev" ] || continue
-    awk -v n="$name" '
-      NR > 2 {
-        iface = $1; sub(/:$/, "", iface)
-        if (iface == "lo") next
-        rx += $2; tx += $10
-      }
-      END { printf "ctr\t%s\t%.0f\t%.0f\n", n, rx + 0, tx + 0 }
-    ' "/proc/$pid/net/dev" 2>/dev/null
+    read -r rx tx < <(awk 'NR > 2 { i = $1; sub(/:$/, "", i); if (i != "lo") { r += $2; t += $10 } }
+                           END { printf "%.0f %.0f\n", r + 0, t + 0 }' "/proc/$pid/net/dev" 2>/dev/null) || continue
+    printf 'ctr\t%s\t%s\t%s\n' "$name" "${rx:-0}" "${tx:-0}"
   done
 }
 
@@ -147,7 +196,7 @@ doctor() {
   [ -n "$i" ] && printf 'iface\tok\t%s\n' "$i" || { printf 'iface\tnone\tno default route\n'; ok=1; }
 
   if command -v docker >/dev/null 2>&1; then
-    if timeout 2 docker ps -q >/dev/null 2>&1; then
+    if timeout -k 1 2 docker ps -q >/dev/null 2>&1; then
       printf 'docker\tok\tcontainer traffic will be named\n'
     else
       printf 'docker\tunreachable\tcontainer traffic stays in the unattributed row\n'
@@ -163,12 +212,26 @@ doctor() {
 # rows would make an app's total fall. We therefore add per-pid deltas into a
 # per-app running total that only ever grows, and hand that to the caller.
 read -r -d '' ACCUMULATE <<'AWK'
-function appname(nm, pid,   parts, k, first, path, line) {
+function appname(nm, pid,   parts, k, first, path, line, toks, nt, i, last) {
   # Chromium and every Electron app report their whole command line as the
   # name. The binary is the first token; the rest is argv and is noise here.
   first = nm
   k = index(first, " ")
-  if (k > 0) first = substr(first, 1, k - 1)
+  if (k > 0 && substr(first, 1, 1) == "/") {
+    # Unless the binary's own path has a space in it. "/opt/Google Chrome/chrome
+    # --type=renderer" is one path and one option, and the first word alone named
+    # every Chrome process "Google". An absolute path runs on through the words
+    # after it up to the last that still holds a slash, and stops at the first
+    # word that is an option or another absolute path.
+    nt = split(first, toks, " ")
+    last = 1
+    for (i = 2; i <= nt; i++) {
+      if (toks[i] ~ /^[-\/]/) break
+      if (index(toks[i], "/") > 0) last = i
+    }
+    first = toks[1]
+    for (i = 2; i <= last; i++) first = first " " toks[i]
+  } else if (k > 0) first = substr(first, 1, k - 1)
   # nethogs prints "curl" or "/usr/bin/curl" for the same binary depending on
   # whether it managed to read /proc in time. Both must land in one row.
   k = split(first, parts, "/")
@@ -194,35 +257,63 @@ function unknownBucket(nm) {
   return (nm ~ /UDP/) ? UNK_UDP : UNK_TCP
 }
 
-function refresh(   line, f, n, seen, nm, i, gone) {
+# Seconds since boot, or -1. Read from the file rather than asked of a program:
+# this runs once per snapshot boundary.
+function uptime(   l, u, t) {
+  t = -1; l = ""
+  if ((getline l < "/proc/uptime") > 0) { split(l, u, " "); t = u[1] + 0 }
+  close("/proc/uptime")
+  return t
+}
+
+# A plain decimal, as nethogs prints one: no sign, no hex, no inf or nan, all of
+# which mawk would otherwise read as numbers.
+function isnum(s) { return s ~ /^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/ }
+
+function refresh(   cmd, line, f, n, nm, i, gone) {
   # One helper call answers three questions: has the default route moved, has
   # the day rolled over, and what have the containers transferred.
+  #
+  # A fixed string, in a variable. The helper's path reaches the shell that
+  # getline starts through the environment (NU_HELPER), so nothing is spliced
+  # into a command: a plugin folder with a space in it ran a program named by
+  # its first word. And a variable rather than an expression left of `|`, which
+  # POSIX awk leaves ambiguous: mawk read HELPER " probe" | getline as
+  # HELPER (" probe" | getline), ran a command called "probe", then compared the
+  # string HELPER "0" with 0, which is true, so the loop never ended. The probe
+  # has a deadline of its own, so a docker daemon that never answers costs a
+  # skipped refresh rather than a stalled stream.
+  cmd = "exec timeout -k 1 10 \"$NU_HELPER\" probe 2>/dev/null"
   # Element-wise: `delete array` without a subscript is a gawk extension
   # that mawk rejects, and this same program runs under the CI runner's awk.
   for (nm in ctrSeen) delete ctrSeen[nm]
-  while ((HELPER " probe" | getline line) > 0) {
+  while ((cmd | getline line) > 0) {
     n = split(line, f, "\t")
     if (n >= 2 && f[1] == "iface") { curIface = f[2]; continue }
     if (n >= 2 && f[1] == "day")   { curDay = f[2];   continue }
-    if (n >= 4 && f[1] == "ctr") {
+    if (n >= 4 && f[1] == "ctr" && isnum(f[3]) && isnum(f[4])) {
       nm = substr(f[2], 1, MAX_NAME)
       if (!(nm in ctrBaseRx)) { ctrBaseRx[nm] = f[3] + 0; ctrBaseTx[nm] = f[4] + 0 }
       # A container that restarts resets its counters; rebase rather than
-      # subtract a larger number from a smaller one.
-      if (f[3] + 0 < ctrBaseRx[nm]) ctrBaseRx[nm] = f[3] + 0
-      if (f[4] + 0 < ctrBaseTx[nm]) ctrBaseTx[nm] = f[4] + 0
+      # subtract a larger number from a smaller one. What it had counted before
+      # stays carved out of the unknown row below: those bytes went into that
+      # row once, and handing them back would count them a second time.
+      if (f[3] + 0 < ctrBaseRx[nm]) { goneRx += ctrRx[nm]; ctrBaseRx[nm] = f[3] + 0 }
+      if (f[4] + 0 < ctrBaseTx[nm]) { goneTx += ctrTx[nm]; ctrBaseTx[nm] = f[4] + 0 }
       ctrRx[nm] = f[3] + 0 - ctrBaseRx[nm]
       ctrTx[nm] = f[4] + 0 - ctrBaseTx[nm]
       ctrSeen[nm] = 1
     }
   }
-  close(HELPER " probe")
+  close(cmd)
 
   # A container that is gone takes its baseline with it. Keeping them is what
   # turns a churn of short-lived containers into a map that only ever grows.
+  # Its bytes stay carved out of the unknown row, for the same reason as above.
   n = 0
   for (nm in ctrBaseRx) if (!(nm in ctrSeen)) gone[++n] = nm
   for (i = 1; i <= n; i++) {
+    goneRx += ctrRx[gone[i]]; goneTx += ctrTx[gone[i]]
     delete ctrBaseRx[gone[i]]; delete ctrBaseTx[gone[i]]
     delete ctrRx[gone[i]];     delete ctrTx[gone[i]]
     delete gone[i]
@@ -253,7 +344,7 @@ function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
   printf "snap\t%s\n", curDay
   kers()
 
-  cUp = 0; cDown = 0
+  cUp = goneTx; cDown = goneRx
   for (a in ctrSeen) { cUp += ctrTx[a]; cDown += ctrRx[a] }
 
   for (a in accUp) {
@@ -276,6 +367,17 @@ function emit(   a, cUp, cDown, tUp, tDown, uUp, uDown, d) {
   uUp   -= cUp;   if (uUp < 0)   uUp = 0
   uDown -= cDown; if (uDown < 0) uDown = 0
 
+  # Never a running total lower than one already printed. The container
+  # counters above are refreshed every PROBE_EVERY snapshots and the unknown
+  # rows every snapshot, so the remainder rose and fell between probes, and the
+  # reader takes a total that fell for a fresh count and adds the next rise
+  # again: steady container traffic was recorded 1.8 times over. Held at its
+  # high-water mark, the remainder is late by at most a few snapshots instead.
+  if (tUp   < hwTU) tUp   = hwTU; else hwTU = tUp
+  if (tDown < hwTD) tDown = hwTD; else hwTD = tDown
+  if (uUp   < hwUU) uUp   = hwUU; else hwUU = uUp
+  if (uDown < hwUD) uDown = hwUD; else hwUD = uDown
+
   if (tUp > 0 || tDown > 0)
     printf "row\t%.0f\t%.0f\tunattributed\t%s\n", tUp, tDown, UNK_TCP
   if (uUp > 0 || uDown > 0)
@@ -293,6 +395,17 @@ BEGIN {
 
 # A snapshot boundary. Everything gathered since the last one is now complete.
 /^Refreshing:/ {
+  # nethogs prints one of these every -d seconds, and it also prints every
+  # process's command line verbatim, newlines and all, so any local account can
+  # put this same line on our input. One process doing so produced 24,006
+  # boundaries in eight seconds and a probe fork for every fifth. A boundary
+  # sooner than MINGAP seconds after the last is not one. MINGAP=0 turns this
+  # off, for a capture replayed from a file.
+  if (MINGAP + 0 > 0) {
+    now = uptime()
+    if (now >= 0 && lastB >= 0 && now - lastB < MINGAP + 0) next
+    lastB = now
+  }
   if (++sinceProbe >= PROBE_EVERY) { refresh(); sinceProbe = 0 }
   # The route moving or the day turning both invalidate this nethogs process:
   # it enumerated its interfaces once at startup and its counters are bound to
@@ -310,6 +423,9 @@ BEGIN {
   if (started) emit()
   started = 1
   rows = 0
+  # Who was in the snapshot that just ended. See the rows below.
+  for (k in seenPrev) delete seenPrev[k]
+  for (k in seenNow) { seenPrev[k] = 1; delete seenNow[k] }
   next
 }
 
@@ -317,9 +433,17 @@ length($0) > MAX_LINE { next }
 
 {
   if (++rows > MAX_ROWS) next
-  if (split($0, F, "\t") != 3) next          # every banner and notice fails here
+  # Read from the right. The name is a process's own command line, which any
+  # process may fill with tabs; the last two fields are the only part nethogs
+  # writes itself. A tab in a name used to fail the field count, and that
+  # process's traffic, 5.6 GB in one test, was dropped without a word.
+  nf = split($0, F, "\t")
+  if (nf < 3) next                            # every banner and notice fails here
+  if (!isnum(F[nf - 1]) || !isnum(F[nf])) next
+  head = F[1]
+  for (i = 2; i <= nf - 2; i++) head = head "\t" F[i]
 
-  m = split(F[1], S, "/")
+  m = split(head, S, "/")
   if (m < 3) next
   uid = S[m]; pid = S[m - 1]
   if (pid !~ /^[0-9]+$/ || uid !~ /^[0-9]+$/) next
@@ -328,16 +452,26 @@ length($0) > MAX_LINE { next }
 
   # Printed at six significant digits, so anything past a megabyte arrives as
   # 5.12971e+06. awk widens it correctly; parseInt would read it as 5.
-  up = F[2] + 0; down = F[3] + 0
-  if (up < 0 || down < 0) next
+  up = F[nf - 1] + 0; down = F[nf] + 0
+  if (up > 1e15 || down > 1e15) next          # a petabyte per process is not a measurement
 
-  key = F[1]
+  key = head
   # Membership before the reads below: merely naming lastUp[key] in an
   # expression creates the element, so testing afterwards is always false and
   # the key ceiling would never stand the accumulator down.
   if (!(key in lastUp)) nKeys++
-  du = up - lastUp[key];   if (du < 0) du = up
-  dd = down - lastDown[key]; if (dd < 0) dd = down
+  # nethogs prints every process it holds on every refresh, idle or not, and
+  # forgets one that has been quiet for a while; when it speaks again its total
+  # starts from zero. So a key missing from the snapshot before this one is a
+  # fresh count, and all of it is new. Subtracting the old total from it lost
+  # that much traffic whenever the new total had grown past the old one.
+  if ((key in seenPrev) || (key in seenNow)) {
+    du = up - lastUp[key];     if (du < 0) du = up
+    dd = down - lastDown[key]; if (dd < 0) dd = down
+  } else {
+    du = up; dd = down
+  }
+  seenNow[key] = 1
   lastUp[key] = up; lastDown[key] = down
 
   a = (pid + 0 == 0) ? unknownBucket(name) : appname(name, pid)
@@ -356,31 +490,75 @@ AWK
 
 SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
 
+# MINGAP is half the interval, in seconds: see the boundary rule in ACCUMULATE.
 run_accumulator() {
   local iface=$1 interval=$2 probe_every=$3
-  "$NETHOGS" -t -C -v 2 -d "$interval" "${NH_FILTER[@]}" "$iface" 2>/dev/null |
-    awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
+  awk_flags
+  "$NETHOGS" -t -C -v 2 -d "$interval" "${NH_FILTER[@]}" -- "$iface" 2>/dev/null |
+    NU_HELPER="$SELF" awk "${AWK_FLAGS[@]}" -v MINGAP="$((interval * 500))e-3" \
+        -v IFACE="$iface" -v PROBE_EVERY="$probe_every" \
         -v PROCDEV="${NET_USAGE_PROC_DEV:-/proc/net/dev}" \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
         -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
         -- "$ACCUMULATE"
 }
 
+# True when this process leads its own process group. Read from /proc rather
+# than asked of ps; the command name in that line may hold spaces, so the
+# fields are counted from the parenthesis that closes it.
+own_group() {
+  local stat pgrp
+  stat=$(< "/proc/$$/stat") || return 1
+  stat=${stat##*) }
+  read -r _ _ pgrp _ <<<"$stat"
+  [ "$pgrp" = "$$" ]
+}
+
+# A sleep that a signal ends. bash runs a trap only once the foreground command
+# it is waiting on has finished; `wait` is the one it interrupts.
+nap() { sleep "$1" & wait $!; }
+
 # Long-lived. Restarts nethogs when the accumulator stands down, which it does
 # when the default route moves or the day turns — nethogs enumerates its
 # interfaces exactly once at startup, so a Wi-Fi association or a tunnel coming
 # up after it started is invisible to it for the rest of its life.
+#
+# It runs in a process group of its own and takes the whole group down on TERM.
+# Quickshell stops a Process by signalling the one pid it started, and nethogs
+# and awk used to outlive it, reparented, until their next write found the pipe
+# closed. setsid can make a new group without forking only for a process that
+# does not lead one already; a terminal's job does, and keeps its own.
 stream() {
-  local interval=${1:-2} iface
+  local interval=${1:-2} iface fails=0 t0
+  whole "$interval" 1 10 || die "the interval is a whole number of seconds, 1 to 10"
+  interval=$((10#$interval))
   [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
+  if ! own_group && command -v setsid >/dev/null 2>&1; then
+    exec setsid "$SELF" stream "$interval"
+  fi
+  trap 'trap - TERM INT; kill -TERM 0 2>/dev/null' TERM INT
   while :; do
     iface=$(default_iface)
     if [ -z "$iface" ]; then
-      printf 'wait\tno default route\n'; sleep 5; continue
+      printf 'wait\tno default route\n'; nap 5; continue
     fi
+    set_filter "$iface"
     printf 'ready\t%s\t%s\n' "$iface" "$interval"
-    run_accumulator "$iface" "$interval" 5
-    sleep 2
+    t0=$SECONDS
+    run_accumulator "$iface" "$interval" 5 &
+    wait $!
+    # nethogs that stops within seconds of starting will stop again: it has no
+    # capture capability, or pcap refused the interface. Restarting it every two
+    # seconds said `ready` every two seconds, which read to the panel as a
+    # collector that was working. Say what happened, and back off.
+    if [ $((SECONDS - t0)) -lt 5 ]; then
+      fails=$((fails + 1))
+      printf 'wait\tnethogs stopped right after starting\n'
+      nap $((fails < 6 ? 5 * fails : 30))
+    else
+      fails=0
+      nap 2
+    fi
   done
 }
 
@@ -395,14 +573,18 @@ human() {
 # The hand-runnable view. Watches for a few seconds and prints what moved.
 top() {
   local n=${1:-10} secs=${2:-6} iface
+  whole "$n" 1 1000 || die "the row count is a whole number, 1 to 1000"
+  whole "$secs" 1 3600 || die "the window is a whole number of seconds, 1 to 3600"
+  n=$((10#$n)); secs=$((10#$secs))
   [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
   iface=$(default_iface) || true
   [ -n "$iface" ] || die "no default route: nothing to watch"
+  set_filter "$iface"
 
   printf 'Watching %s for %ss...\n\n' "$iface" "$secs"
   local rows
-  rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" "$iface" 2>/dev/null |
-    awk -v HELPER="$SELF" -v IFACE="$iface" -v PROBE_EVERY=3 \
+  rows=$(timeout -k 1 "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" -- "$iface" 2>/dev/null |
+    NU_HELPER="$SELF" awk -v MINGAP=0.5 -v IFACE="$iface" -v PROBE_EVERY=3 \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
         -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
         -- "$ACCUMULATE" |
@@ -464,6 +646,8 @@ validate() {
   local secs=${1:-5} iface fixdir="${NET_USAGE_FIXTURE_DIR:-}"
   local kbefore kafter rows helper
   local brx btx arx atx kup kdown cup cdown ctot ktot ratio
+  whole "$secs" 1 3600 || die "the window is a whole number of seconds, 1 to 3600"
+  secs=$((10#$secs))
 
   if [ -n "$fixdir" ]; then
     [ -f "$fixdir/stream.txt" ] || die "fixture $fixdir/stream.txt is missing"
@@ -486,6 +670,7 @@ validate() {
     [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
     iface=$(default_iface) || true
     [ -n "$iface" ] || die "no default route: nothing to watch"
+    set_filter "$iface"
     helper=$SELF
   fi
 
@@ -493,7 +678,7 @@ validate() {
 
   if [ -n "$fixdir" ]; then
     kbefore=$(proc_dev_counters "$fixdir/proc_before" "$iface")
-    rows=$(awk -v HELPER="$helper" -v IFACE="$iface" -v PROBE_EVERY=3 \
+    rows=$(NU_HELPER="$helper" awk -v MINGAP=0 -v IFACE="$iface" -v PROBE_EVERY=3 \
         -v PROCDEV=/dev/null \
         -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
         -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
@@ -502,8 +687,8 @@ validate() {
     kafter=$(proc_dev_counters "$fixdir/proc_after" "$iface")
   else
     kbefore=$(proc_dev_counters /proc/net/dev "$iface")
-    rows=$(timeout "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" "$iface" 2>/dev/null |
-      awk -v HELPER="$helper" -v IFACE="$iface" -v PROBE_EVERY=3 \
+    rows=$(timeout -k 1 "$((secs + 2))" "$NETHOGS" -t -C -v 2 -d 1 "${NH_FILTER[@]}" -- "$iface" 2>/dev/null |
+      NU_HELPER="$helper" awk -v MINGAP=0.5 -v IFACE="$iface" -v PROBE_EVERY=3 \
           -v PROCDEV="${NET_USAGE_PROC_DEV:-/proc/net/dev}" \
           -v MAX_LINE="$MAX_LINE" -v MAX_ROWS="$MAX_ROWS" \
           -v MAX_APPS="$MAX_APPS" -v MAX_NAME="$MAX_NAME" -v MAX_KEYS="$MAX_KEYS" \
@@ -564,14 +749,16 @@ bytes_matching() {
   local iface=$1 secs=$2 filt=$3
   # Two refreshes: the first arrives empty because nethogs has nothing to
   # report yet, the second carries the window's running total per row.
-  timeout "$((secs * 2 + 4))" \
-    "$NETHOGS" -t -C -v 2 -d "$secs" -c 2 -f "$filt" "$iface" 2>/dev/null |
+  timeout -k 1 "$((secs * 2 + 4))" \
+    "$NETHOGS" -t -C -v 2 -d "$secs" -c 2 -f "$filt" -- "$iface" 2>/dev/null |
     awk -F'\t' 'NF == 3 { d[$1] = $3 + 0 }
                 END { s = 0; for (k in d) s += d[k]; printf "%.0f\n", s }'
 }
 
 explain() {
   local secs=${1:-4} iface total got pct i
+  whole "$secs" 1 600 || die "the window is a whole number of seconds, 1 to 600"
+  secs=$((10#$secs))
   [ -x "$NETHOGS" ] || die "nethogs is not installed at $NETHOGS"
   iface=$(default_iface) || true
   [ -n "$iface" ] || die "no default route: nothing to watch"
@@ -596,7 +783,12 @@ explain() {
   # A global, not a local: the trap outlives the function that sets it, and
   # under `set -u` a dead local would abort the cleanup it was written to do.
   NH_TMP=$(mktemp -d) || die "cannot create a temporary directory"
-  trap 'rm -rf "${NH_TMP:-}"' EXIT INT TERM
+  # The cleanup on EXIT alone, and a signal turned into an exit. A trap on TERM
+  # that only removed the folder let the run go on to print a table of zeros
+  # and exit 0, with six captures still running behind it.
+  trap 'rm -rf "${NH_TMP:-}"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   printf 'Sampling %s behind %d filters at once, for %ss.\n\n' \
     "$iface" "${#filters[@]}" "$((secs * 2))"
@@ -673,11 +865,22 @@ sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
   or exit($! == ENOENT ? 0 : 3);
 
 my @st = stat($fh) or exit 3;
-my ($mode, $uid, $size) = @st[2, 4, 7];
+my ($mode, $nlink, $uid, $size) = @st[2, 3, 4, 7];
 
 exit 3 unless ($mode & 0170000) == 0100000;   # not a FIFO, device or directory
 exit 3 unless $uid == $<;                     # and written by this user
+exit 3 if $nlink != 1;                        # with no second name somebody else holds
+exit 3 if $mode & 0022;                       # and nobody else may write it
 exit 3 if $size > $max;                       # refused whole, never truncated
+
+# O_NOFOLLOW covers the last component only. The folder above is this plugin's
+# own, made 0700 by the panel, so one reached through a link, or that somebody
+# else could write into, is not where this history was kept.
+my ($dir) = $path =~ m{^(.*)/[^/]+$};
+my @dst = lstat($dir) or exit 3;
+exit 3 unless ($dst[2] & 0170000) == 0040000;  # a real directory, not a link to one
+exit 3 unless $dst[4] == $<;
+exit 3 if $dst[2] & 0022;
 
 binmode $fh;
 binmode STDOUT;
@@ -716,13 +919,20 @@ history_write() {
   perl /dev/fd/3 "$(history_path)" "$MAX_HISTORY" 3<<'PERL'
 use strict;
 use warnings;
-use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_NOFOLLOW);
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_RDONLY O_DIRECTORY);
 use Errno qw(EINTR);
 use IO::Handle;
 
 my ($path, $max) = @ARGV;
 my ($dir) = $path =~ m{^(.*)/[^/]+$};
 exit 1 unless defined $dir && length $dir;
+
+# The temporary file is removed on every end this process can see coming: a
+# signal becomes an exit, and an exit runs END. A TERM in the middle of the
+# fsync used to leave .history.<pid>.<n>.tmp behind for good.
+my $tmp;
+END { unlink $tmp if defined $tmp }
+$SIG{$_} = sub { exit 1 } for qw(TERM INT HUP PIPE XFSZ);
 
 # Bounded here too. A store this side of the ceiling is one the reader will
 # still accept next time; anything past it would be written once and refused
@@ -738,10 +948,28 @@ while (1) {
 }
 exit 1 unless length $doc;
 
-my ($fh, $tmp);
+# What a run killed outright left behind (SIGKILL is not a signal anything can
+# catch): only names this writer makes, only regular files of ours, and only
+# ones an hour old, which no write still in progress can own.
+if (opendir(my $dh, $dir)) {
+  for my $n (readdir $dh) {
+    next unless $n =~ /^\.history\.[0-9a-f.]+\.tmp$/;
+    my @st = lstat("$dir/$n") or next;
+    next unless -f _ && $st[4] == $< && time - $st[9] > 3600;
+    unlink "$dir/$n";
+  }
+  closedir $dh;
+}
+
+# A random name rather than the pid: a pid comes round again, and a name that
+# can be guessed can be waited for.
+my $fh;
 for my $try (1 .. 16) {
-  $tmp = sprintf('%s/.history.%d.%d.tmp', $dir, $$, $try);
-  last if sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  open(my $r, '<', '/dev/urandom') or exit 1;
+  read($r, my $rnd, 8) == 8 or exit 1;
+  close $r;
+  my $name = sprintf('%s/.history.%s.tmp', $dir, unpack('H*', $rnd));
+  if (sysopen($fh, $name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600)) { $tmp = $name; last }
   undef $fh;
 }
 exit 1 unless $fh;
@@ -750,18 +978,27 @@ binmode $fh;
 my $off = 0;
 while ($off < length $doc) {
   my $n = syswrite($fh, $doc, length($doc) - $off, $off);
-  if (!defined $n) { next if $! == EINTR; close $fh; unlink $tmp; exit 1 }
+  if (!defined $n) { next if $! == EINTR; exit 1 }
   $off += $n;
 }
 # On the disk before the name points at it, so a power cut leaves the old store
-# rather than a new one full of holes.
-$fh->sync;
-close($fh) or do { unlink $tmp; exit 1 };
+# rather than a new one full of holes. A failed fsync is a failed write.
+defined($fh->sync) or exit 1;
+close($fh) or exit 1;
 
-unless (rename($tmp, $path)) { unlink $tmp; exit 1 }
+rename($tmp, $path) or exit 1;
+undef $tmp;                               # renamed: nothing left to remove
+
+# The rename is a write of its own, to the folder. Until that is on the disk
+# too, a power cut can bring back the old name, or none.
+if (sysopen(my $dfh, $dir, O_RDONLY | O_DIRECTORY)) { $dfh->sync; close $dfh }
 exit 0;
 PERL
 }
+
+# Sourced rather than run (the tests do, to reach one function at a time): define
+# everything above and do nothing.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 case "${1:-top}" in
   stream)  shift; stream "$@" ;;

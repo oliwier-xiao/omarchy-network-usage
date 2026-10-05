@@ -40,7 +40,9 @@ BarWidget {
   function pushSettings() {
     var s = root.service
     if (!s) return
-    s.sampleSeconds = Number(setting("sampleSeconds", 2)) || 2
+    // 1 to 10, the range the collector accepts; a hand-edited setting outside
+    // it would otherwise stop the stream before it started.
+    s.sampleSeconds = Math.min(10, Math.max(1, Math.round(Number(setting("sampleSeconds", 2)) || 2)))
     s.keepDays = Number(setting("keepDays", 90)) || 90
     s.nameContainers = setting("nameContainers", true) === true
     s.countLanNoise = setting("countLanNoise", false) === true
@@ -125,12 +127,16 @@ BarWidget {
     hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
     horizontalMargin: 8.5
+    // The tooltip renders AutoText, so everything not written here goes through
+    // Model.plain: the interface name is whatever the setting or the route says,
+    // and the reason is the collector's own line.
     tooltipText: {
       if (!root.serviceReady) return "Network usage · starting"
-      if (!root.available) return "Network usage · " + (root.service.unavailableReason || "not counting")
+      if (!root.available)
+        return "Network usage · " + Model.plain(String(root.service.unavailableReason || "not counting").slice(0, 120))
       return "Today · ↓ " + Model.formatBytes(root.down)
         + "   ↑ " + Model.formatBytes(root.up)
-        + (root.service.watching ? "  on " + root.service.watching : "")
+        + (root.service.watching ? "  on " + Model.plain(String(root.service.watching).slice(0, 32)) : "")
     }
     onPressed: function (b) {
       if (b === Qt.RightButton) root.toggleIconOnly()

@@ -5,42 +5,68 @@ on:
     branches: [main]
   pull_request:
 
+# A read-only token and no secrets: nothing in this workflow pushes, comments or
+# publishes. The marketplace's own workflows are written the same way.
+permissions:
+  contents: read
+
+# Every job runs on a named release rather than ubuntu-latest, so the runner
+# changes when this file says so, and checks out by commit, as the marketplace's
+# own workflows do, without leaving the token in .git/config. Nothing is
+# installed: node 22, jq, shellcheck, gawk, mawk and perl are on the image.
 jobs:
   js:
     name: lib checks + tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: 20
+          persist-credentials: false
       - name: Syntax check
-        run: node --check lib/Model.js && node --check lib/Palette.js
+        run: node --version && node --check lib/Model.js && node --check lib/Palette.js
       - name: Unit tests
         # Explicit files: bare `node --test tests/` treats the directory as a
         # test file on some node versions and fails the whole run.
-        run: node --test tests/model.test.js tests/palette.test.js tests/wire.test.js
+        # service.test.js runs Service.qml's own functions and line handler.
+        run: node --test tests/model.test.js tests/palette.test.js tests/wire.test.js tests/service.test.js
 
   shell:
     name: collector checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Syntax check
-        run: bash -n bin/net-usage
-      - name: Fixture test (validate, offline, no nethogs needed)
-        run: ./tests/validate-fixture.sh
+        run: |
+          for f in bin/net-usage tests/*.sh; do bash -n "$f" || { echo "syntax error in $f"; exit 1; }; done
       # shellcheck ships on the GitHub Ubuntu runner image. Installing it here
       # would put a privileged package-manager call in the repository, which the
       # marketplace security baseline reads and reports against the plugin.
       - name: Shellcheck
-        run: shellcheck -S warning bin/net-usage || true
+        run: shellcheck -S warning bin/net-usage tests/*.sh
+      - name: The awks the suites run under
+        run: |
+          for a in gawk mawk; do printf '%s: ' "$a"; command -v "$a" || echo missing; done
+      - name: Fixture tests (validate, offline, no nethogs needed)
+        # Under every awk present, and under a comma-decimal locale when one can
+        # be built. Each run has a deadline, so a hang fails instead of running on.
+        run: ./tests/validate-fixture.sh
+      - name: Accumulator tests
+        run: ./tests/accumulator.test.sh
+      - name: Stream loop tests
+        run: ./tests/stream.test.sh
 
   manifest:
     name: manifest shape
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Valid JSON
         run: jq -e . manifest.json > /dev/null
       - name: schemaVersion is the number 1
@@ -54,10 +80,20 @@ jobs:
         run: |
           jq -e '(.kinds | index("service") | not) or (.entryPoints | has("service"))' manifest.json > /dev/null
           jq -e '(.kinds | index("bar-widget") | not) or (.entryPoints | has("barWidget"))' manifest.json > /dev/null
-      - name: Every setting in the schema has a matching default
+      - name: Settings, schema and defaults agree
+        # One rule for all of it (see the file): duplicate keys, a default with no
+        # setting or a setting with no default, a default of the wrong type, an
+        # enum default that is not an option, an integer outside min..max.
         run: |
-          jq -e '.barWidget as $w | [$w.schema[] | select($w.defaults[.key] != .defaultValue)] | length == 0' manifest.json > /dev/null \
-            || { jq -r '.barWidget as $w | $w.schema[] | select($w.defaults[.key] != .defaultValue) | "default differs from schema: " + .key' manifest.json; exit 1; }
+          jq -e -f tests/manifest-check.jq manifest.json > /dev/null || {
+            jq -r '.barWidget as $w | (($w.defaults | keys) - [$w.schema[].key])[] | "default with no setting: " + .' manifest.json
+            jq -r '.barWidget as $w | $w.schema[] | select($w.defaults[.key] != .defaultValue) | "default differs from schema: " + .key' manifest.json
+            echo "tests/manifest-check.jq failed"; exit 1; }
+      - name: Every setting the QML reads is in the schema, and the other way round
+        run: |
+          used=$(grep -ohE 'setting\("[A-Za-z]+"' ./*.qml | sed 's/setting("//; s/"$//' | sort -u)
+          declared=$(jq -r '.barWidget.schema[].key' manifest.json | sort -u)
+          [ "$used" = "$declared" ] || { diff <(echo "$used") <(echo "$declared"); exit 1; }
       - name: No symlinks anywhere
         run: |
           found=$(find . -path ./.git -prune -o -type l -print)
